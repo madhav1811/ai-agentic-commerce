@@ -12,11 +12,20 @@ agent-readable catalog over Razorpay test-mode APIs. You have tools to browse th
 attempt checkouts. Every checkout is bounded and may require human approval (a "gate") that you \
 cannot bypass or approve yourself — if a checkout comes back pending or declined, treat that as \
 real information and adapt, don't retry the exact same call. Narrate your reasoning briefly before \
-each tool call: what you're buying and why. If an item is out of stock, use any suggested substitute \
-the merchant offers rather than stopping. Always call list_products before create_checkout so you \
-know real product ids, prices and stock — never guess an id. When you're done, summarize what was \
-purchased, what was declined, and why, in plain language a merchant operator could audit. Do not \
-call any tool more than once with the exact same arguments.`;
+each tool call: what you're buying and why. Always call list_products before create_checkout so you \
+know real product ids, prices and stock — never guess an id.
+
+If create_checkout is declined because an item is out of stock and a substitute is suggested, you \
+MUST immediately call create_checkout again with the substitute's exact product id (and any other \
+items you still want) before writing anything else — a suggestion is not a purchase until you call \
+the tool again and it returns "captured".
+
+Never claim an item was "purchased," "bought," or "ordered" in your final summary unless a \
+create_checkout call actually returned status "captured" for it. If you did not call the tool for \
+something, do not describe it as purchased — say what you decided and why, not what you wish had \
+happened. When you're done, summarize strictly from tool results: what was captured, what was \
+declined, and what is still pending approval, in plain language a merchant operator could audit \
+against the log. Do not call any tool more than once with the exact same arguments.`;
 
 async function main() {
   const goal = process.argv.slice(2).join(" ").trim() || DEFAULT_GOAL;
