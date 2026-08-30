@@ -7,6 +7,9 @@ export interface Product {
   category: string;
   stock: number;
   upsellWith: string[];
+  rating: number;
+  numReviews: number;
+  specs: Record<string, string | number | boolean>;
 }
 
 export interface Merchant {
@@ -32,12 +35,20 @@ export interface CheckoutRequestBody {
 
 export type CheckoutResult =
   | { status: "declined"; reasons: string[]; suggestion?: Product }
-  | { status: "pending_approval"; approvalId: string; reasons: string[]; amount: number; currency: string }
+  | {
+      status: "pending_approval";
+      approvalId: string;
+      reasons: string[];
+      amount: number;
+      amountDisplay: string;
+      currency: string;
+    }
   | {
       status: "captured";
       orderId: string;
       paymentId: string;
       amount: number;
+      amountDisplay: string;
       currency: string;
       simulated: boolean;
     }

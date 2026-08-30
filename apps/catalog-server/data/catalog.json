@@ -13,7 +13,10 @@
       "currency": "INR",
       "category": "electronics",
       "stock": 12,
-      "upsellWith": ["prod_charger_65w"]
+      "upsellWith": ["prod_charger_65w"],
+      "rating": 4.3,
+      "numReviews": 812,
+      "specs": { "batteryHours": 30, "noiseCancellation": true, "type": "over-ear", "bluetoothVersion": "5.3" }
     },
     {
       "id": "prod_smartwatch_pulse2",
@@ -23,7 +26,10 @@
       "currency": "INR",
       "category": "electronics",
       "stock": 0,
-      "upsellWith": []
+      "upsellWith": [],
+      "rating": 4.1,
+      "numReviews": 340,
+      "specs": { "batteryDays": 7, "heartRateMonitor": true, "spo2": true, "waterResistant": true }
     },
     {
       "id": "prod_speaker_boom_mini",
@@ -33,7 +39,10 @@
       "currency": "INR",
       "category": "electronics",
       "stock": 30,
-      "upsellWith": ["prod_charger_65w"]
+      "upsellWith": ["prod_charger_65w"],
+      "rating": 4.0,
+      "numReviews": 505,
+      "specs": { "batteryHours": 12, "waterproofRating": "IPX7", "portable": true }
     },
     {
       "id": "prod_backpack_urban",
@@ -43,7 +52,10 @@
       "currency": "INR",
       "category": "accessories",
       "stock": 20,
-      "upsellWith": ["prod_charger_65w"]
+      "upsellWith": ["prod_charger_65w"],
+      "rating": 4.4,
+      "numReviews": 275,
+      "specs": { "laptopSizeInches": 15, "waterResistant": true, "capacityLiters": 22 }
     },
     {
       "id": "prod_giftcard_500",
@@ -53,7 +65,10 @@
       "currency": "INR",
       "category": "gift-cards",
       "stock": 999,
-      "upsellWith": []
+      "upsellWith": [],
+      "rating": 4.8,
+      "numReviews": 50,
+      "specs": { "digitalDelivery": true, "expiryYears": 5 }
     },
     {
       "id": "prod_charger_65w",
@@ -63,7 +78,10 @@
       "currency": "INR",
       "category": "electronics",
       "stock": 40,
-      "upsellWith": []
+      "upsellWith": [],
+      "rating": 4.2,
+      "numReviews": 190,
+      "specs": { "wattage": 65, "ports": 3, "ganTech": true }
     }
   ]
 }

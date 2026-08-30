@@ -6,6 +6,20 @@ export async function listProducts() {
   return res.json();
 }
 
+export async function recommendProducts(criteria: {
+  category?: string;
+  maxPrice?: number;
+  mustHave?: string[];
+  excludeIds?: string[];
+}) {
+  const res = await fetch(`${BASE_URL}/recommend`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(criteria),
+  });
+  return res.json();
+}
+
 export async function requestCheckout(actor: string, items: { productId: string; quantity: number }[]) {
   const res = await fetch(`${BASE_URL}/checkout`, {
     method: "POST",

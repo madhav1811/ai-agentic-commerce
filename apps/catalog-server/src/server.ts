@@ -13,6 +13,13 @@ const checkoutRequestSchema = z.object({
   items: z.array(checkoutItemSchema).min(1),
 });
 
+const recommendRequestSchema = z.object({
+  category: z.string().optional(),
+  maxPrice: z.number().positive().optional(),
+  mustHave: z.array(z.string()).optional(),
+  excludeIds: z.array(z.string()).optional(),
+});
+
 export function createServer(service: CheckoutService) {
   const app = express();
   app.use(express.json());
@@ -35,6 +42,17 @@ export function createServer(service: CheckoutService) {
     const product = service.getProduct(req.params.id);
     if (!product) return res.status(404).json({ error: "not_found" });
     res.json(product);
+  });
+
+  // Deterministic, explainable ranking — every candidate comes back with the
+  // actual numbers behind its score, so a buyer agent (or a human) can be
+  // told *why* something is "the best" instead of taking an LLM's word for it.
+  app.post("/recommend", (req, res) => {
+    const parsed = recommendRequestSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ error: "invalid_request", details: parsed.error.flatten() });
+    }
+    res.json({ candidates: service.recommend(parsed.data) });
   });
 
   app.post("/checkout", async (req, res) => {

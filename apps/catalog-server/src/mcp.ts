@@ -37,6 +37,31 @@ server.tool(
 );
 
 server.tool(
+  "recommend_products",
+  "Rank real, in-stock candidates by rating and budget fit (optionally filtered by category and " +
+    "required features). Returns each candidate with the concrete score breakdown behind it. Always " +
+    "call this before telling anyone what 'the best' product is — never guess or rank from memory. " +
+    "Call list_products first if you haven't already, so you know the real category strings and prices.",
+  {
+    category: z
+      .string()
+      .optional()
+      .describe(
+        "Must exactly match a category string already seen from list_products. If unsure, omit — " +
+          "maxPrice and mustHave alone still filter correctly."
+      ),
+    maxPrice: z
+      .number()
+      .positive()
+      .optional()
+      .describe("In the catalog's minor currency unit (paise for INR) — multiply a rupee amount by 100."),
+    mustHave: z.array(z.string()).optional(),
+    excludeIds: z.array(z.string()).optional(),
+  },
+  async (criteria) => ({ content: [{ type: "text", text: JSON.stringify(service.recommend(criteria)) }] })
+);
+
+server.tool(
   "create_checkout",
   "Attempt to buy one or more products as a named agent/buyer. Subject to the merchant's bounds " +
     "(max order amount, daily spend cap, allowed categories) and may require human approval " +

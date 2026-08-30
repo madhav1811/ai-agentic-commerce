@@ -3,6 +3,7 @@ import { AuditLog } from "@aac/audit-log";
 import { PolicyEngine } from "@aac/policy-engine";
 import { RazorpayClient, describeRazorpayError } from "@aac/razorpay-client";
 import { config, loadCatalog } from "./config.js";
+import { formatInr, rankProducts, type RecommendCriteria, type RankedProduct } from "./recommend.js";
 import type { Catalog, CheckoutRequestBody, CheckoutResult, Product } from "./types.js";
 
 interface PendingApproval {
@@ -34,6 +35,10 @@ export class CheckoutService {
 
   getProduct(productId: string): Product | undefined {
     return this.catalog.products.find((p) => p.id === productId);
+  }
+
+  recommend(criteria: RecommendCriteria): RankedProduct[] {
+    return rankProducts(this.catalog.products, criteria);
   }
 
   private suggestSubstitute(outOfStock: Product): Product | undefined {
@@ -118,7 +123,14 @@ export class CheckoutService {
         reasons: decision.reasons,
         details: { approvalId },
       });
-      return { status: "pending_approval", approvalId, reasons: decision.reasons, amount, currency };
+      return {
+        status: "pending_approval",
+        approvalId,
+        reasons: decision.reasons,
+        amount,
+        amountDisplay: formatInr(amount),
+        currency,
+      };
     }
 
     return this.captureOrder(request.actor, resolved, amount, currency);
@@ -214,7 +226,15 @@ export class CheckoutService {
         reasons: ["real Razorpay payment link issued; awaiting human payment"],
         details: { paymentLinkUrl: link.short_url, paymentLinkId: link.id },
       });
-      return { status: "captured", orderId: order.id, paymentId: link.id, amount, currency, simulated: false };
+      return {
+        status: "captured",
+        orderId: order.id,
+        paymentId: link.id,
+        amount,
+        amountDisplay: formatInr(amount),
+        currency,
+        simulated: false,
+      };
     }
 
     const payment = this.razorpay.simulateCapture(order.id, amount, currency);
@@ -233,6 +253,14 @@ export class CheckoutService {
       details: { paymentId: payment.id, simulated: true },
     });
 
-    return { status: "captured", orderId: order.id, paymentId: payment.id, amount, currency, simulated: true };
+    return {
+      status: "captured",
+      orderId: order.id,
+      paymentId: payment.id,
+      amount,
+      amountDisplay: formatInr(amount),
+      currency,
+      simulated: true,
+    };
   }
 }
