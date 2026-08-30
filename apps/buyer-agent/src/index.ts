@@ -1,8 +1,6 @@
-import Anthropic from "@anthropic-ai/sdk";
+import { chat, type OllamaMessage } from "./ollama-client.js";
 import { ACTOR_ID, runTool, tools } from "./tools.js";
 import { fetchAuditLog, verifyAuditChain } from "./catalog-client.js";
-
-const MODEL = process.env.ANTHROPIC_MODEL ?? "claude-sonnet-5";
 
 const DEFAULT_GOAL =
   "Buy the Pulse 2 Smartwatch for a fitness enthusiast. If it's unavailable, use the merchant's " +
@@ -15,55 +13,41 @@ attempt checkouts. Every checkout is bounded and may require human approval (a "
 cannot bypass or approve yourself — if a checkout comes back pending or declined, treat that as \
 real information and adapt, don't retry the exact same call. Narrate your reasoning briefly before \
 each tool call: what you're buying and why. If an item is out of stock, use any suggested substitute \
-the merchant offers rather than stopping. When you're done, summarize what was purchased, what was \
-declined, and why, in plain language a merchant operator could audit.`;
+the merchant offers rather than stopping. Always call list_products before create_checkout so you \
+know real product ids, prices and stock — never guess an id. When you're done, summarize what was \
+purchased, what was declined, and why, in plain language a merchant operator could audit. Do not \
+call any tool more than once with the exact same arguments.`;
 
 async function main() {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) {
-    console.error("Missing ANTHROPIC_API_KEY. Copy .env.example to .env and fill it in.");
-    process.exit(1);
-  }
-  const client = new Anthropic({ apiKey });
-
   const goal = process.argv.slice(2).join(" ").trim() || DEFAULT_GOAL;
-  console.log(`\n🛒 Buyer agent goal: ${goal}\n`);
+  console.log(`\n🛒 Buyer agent goal: ${goal}`);
+  console.log(`   (running locally via Ollama — no API key, no cost)\n`);
 
-  const messages: Anthropic.MessageParam[] = [{ role: "user", content: goal }];
+  const messages: OllamaMessage[] = [
+    { role: "system", content: SYSTEM_PROMPT },
+    { role: "user", content: goal },
+  ];
 
   for (let turn = 0; turn < 8; turn++) {
-    const response = await client.messages.create({
-      model: MODEL,
-      max_tokens: 1024,
-      system: SYSTEM_PROMPT,
-      tools,
-      messages,
-    });
+    const message = await chat(messages, tools);
 
-    const textBlocks = response.content.filter((b): b is Anthropic.TextBlock => b.type === "text");
-    for (const block of textBlocks) {
-      if (block.text.trim()) console.log(`🤖 ${block.text.trim()}\n`);
+    if (message.content.trim()) {
+      console.log(`🤖 ${message.content.trim()}\n`);
     }
 
-    if (response.stop_reason !== "tool_use") {
+    if (!message.tool_calls || message.tool_calls.length === 0) {
+      messages.push(message);
       break;
     }
 
-    messages.push({ role: "assistant", content: response.content });
+    messages.push(message);
 
-    const toolResults: Anthropic.ToolResultBlockParam[] = [];
-    for (const block of response.content) {
-      if (block.type !== "tool_use") continue;
-      console.log(`   → calling ${block.name}(${JSON.stringify(block.input)})`);
-      const result = await runTool(block.name, block.input as Record<string, unknown>);
+    for (const call of message.tool_calls) {
+      console.log(`   → calling ${call.function.name}(${JSON.stringify(call.function.arguments)})`);
+      const result = await runTool(call.function.name, call.function.arguments);
       console.log(`   ← ${JSON.stringify(result)}\n`);
-      toolResults.push({
-        type: "tool_result",
-        tool_use_id: block.id,
-        content: JSON.stringify(result),
-      });
+      messages.push({ role: "tool", content: JSON.stringify(result) });
     }
-    messages.push({ role: "user", content: toolResults });
   }
 
   console.log("──────────────────────────────────────────");
@@ -72,8 +56,12 @@ async function main() {
   for (const e of entries) {
     console.log(`  [${e.seq}] ${e.timestamp}  ${e.action.padEnd(20)} ${e.status.padEnd(9)} ${e.reasons.join("; ")}`);
   }
-  const chain = await verifyAuditChain();
-  console.log(chain.valid ? "\n✅ audit log hash chain verified — untampered" : `\n❌ audit log broken at seq ${chain.brokenAtSeq}`);
+  const chainResult = await verifyAuditChain();
+  console.log(
+    chainResult.valid
+      ? "\n✅ audit log hash chain verified — untampered"
+      : `\n❌ audit log broken at seq ${chainResult.brokenAtSeq}`
+  );
 }
 
 main().catch((err) => {

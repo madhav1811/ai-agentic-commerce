@@ -3,6 +3,10 @@
 Make a merchant transactable by an AI buyer — end to end, on Razorpay test-mode APIs — with every
 money action explainable, bounded, gated, and audited.
 
+**Runs entirely for free.** Razorpay test mode never touches real money or billing. The buyer
+agent runs on a local, open-source LLM via [Ollama](https://ollama.com) — no API key, no per-token
+cost, fully offline once the model is pulled.
+
 ## Why now
 
 NPCI's Unified Agentic Protocol (UAP) and the global protocol race (ACP, AP2, x402) are turning
@@ -20,7 +24,7 @@ log wrapped around every dollar (rupee) that moves.
 ```mermaid
 flowchart LR
     subgraph Buyer["apps/buyer-agent"]
-        LLM["Claude (tool use)"]
+        LLM["Local LLM via Ollama<br/>(tool use, $0 cost)"]
     end
 
     subgraph Merchant["apps/catalog-server"]
@@ -85,13 +89,29 @@ no matter which protocol the buyer used.
 This tradeoff is the same one every real agentic-commerce protocol (ACP, AP2, x402) is racing to
 solve — how an AI buyer authorizes payment without becoming a PCI-scope card handler itself.
 
+## Cost
+
+$0, end to end:
+
+- **Razorpay test mode** is free to sign up for and free to use — it's a sandbox, no real money
+  moves, no billing plan required. You only need a test-mode key pair from the dashboard.
+- **The buyer agent's LLM runs locally via Ollama.** No API key, no per-token billing, no network
+  call beyond `localhost`. You pay in disk space (~5GB for the model) and local compute, once.
+
 ## Setup
 
 ```bash
 npm install
+
+# 1. Free local LLM for the buyer agent
+brew install ollama            # or see https://ollama.com/download
+ollama pull qwen2.5:7b-instruct   # ~4.7GB, one-time download; any tool-calling-capable model works
+
+# 2. Free Razorpay test-mode keys
 cp .env.example .env
-# fill in RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET (test mode, from
-# https://dashboard.razorpay.com/app/keys) and ANTHROPIC_API_KEY
+# fill in RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET from
+# https://dashboard.razorpay.com/app/keys (toggle "Test Mode" — no billing info needed)
+
 npm run build
 ```
 
@@ -150,5 +170,5 @@ packages/audit-log        hash-chained, append-only audit trail
 packages/policy-engine    bounds (max order, daily cap, categories) + human-approval gate
 packages/razorpay-client  thin Razorpay test-mode wrapper (orders, payment links, error parsing)
 apps/catalog-server       REST API + MCP server + the merchant's CheckoutService
-apps/buyer-agent          Claude-powered AI buyer (tool use) + simulated human-operator gate
+apps/buyer-agent          Free, local LLM-powered AI buyer (Ollama tool use) + simulated human-operator gate
 ```
