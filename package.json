@@ -1,0 +1,23 @@
+{
+  "name": "ai-agentic-commerce",
+  "version": "0.1.0",
+  "private": true,
+  "description": "An AI buyer agent transacts end-to-end against a merchant's agent-readable catalog over Razorpay test-mode APIs, with every money action explainable, bounded, gated, and audited.",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "dev:catalog": "npm run dev --workspace=@aac/catalog-server",
+    "dev:agent": "npm run dev --workspace=@aac/buyer-agent",
+    "demo": "npm run build && node apps/buyer-agent/dist/index.js"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.4"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

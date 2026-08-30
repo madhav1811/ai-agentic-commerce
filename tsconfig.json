@@ -1,0 +1,10 @@
+{
+  "files": [],
+  "references": [
+    { "path": "packages/audit-log" },
+    { "path": "packages/policy-engine" },
+    { "path": "packages/razorpay-client" },
+    { "path": "apps/catalog-server" },
+    { "path": "apps/buyer-agent" }
+  ]
+}

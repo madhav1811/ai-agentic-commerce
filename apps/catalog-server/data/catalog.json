@@ -1,0 +1,69 @@
+{
+  "merchant": {
+    "id": "merchant_demo_scaleraibazaar",
+    "name": "ScaleraiBazaar",
+    "currency": "INR"
+  },
+  "products": [
+    {
+      "id": "prod_headphones_bt400",
+      "name": "BT400 Wireless Headphones",
+      "description": "Over-ear Bluetooth headphones, 30h battery, active noise cancellation.",
+      "price": 249900,
+      "currency": "INR",
+      "category": "electronics",
+      "stock": 12,
+      "upsellWith": ["prod_charger_65w"]
+    },
+    {
+      "id": "prod_smartwatch_pulse2",
+      "name": "Pulse 2 Smartwatch",
+      "description": "Fitness smartwatch with heart-rate and SpO2 tracking, 7-day battery.",
+      "price": 349900,
+      "currency": "INR",
+      "category": "electronics",
+      "stock": 0,
+      "upsellWith": []
+    },
+    {
+      "id": "prod_speaker_boom_mini",
+      "name": "Boom Mini Bluetooth Speaker",
+      "description": "Compact IPX7 waterproof speaker, 12h playback.",
+      "price": 129900,
+      "currency": "INR",
+      "category": "electronics",
+      "stock": 30,
+      "upsellWith": ["prod_charger_65w"]
+    },
+    {
+      "id": "prod_backpack_urban",
+      "name": "Urban Commuter Backpack",
+      "description": "Padded 15-inch laptop compartment, water-resistant shell.",
+      "price": 189900,
+      "currency": "INR",
+      "category": "accessories",
+      "stock": 20,
+      "upsellWith": ["prod_charger_65w"]
+    },
+    {
+      "id": "prod_giftcard_500",
+      "name": "ScaleraiBazaar Gift Card (₹500)",
+      "description": "Digital gift card, redeemable storewide.",
+      "price": 50000,
+      "currency": "INR",
+      "category": "gift-cards",
+      "stock": 999,
+      "upsellWith": []
+    },
+    {
+      "id": "prod_charger_65w",
+      "name": "65W GaN Fast Charger",
+      "description": "Compact 3-port GaN charger, pairs well with any laptop or phone order.",
+      "price": 149900,
+      "currency": "INR",
+      "category": "electronics",
+      "stock": 40,
+      "upsellWith": []
+    }
+  ]
+}

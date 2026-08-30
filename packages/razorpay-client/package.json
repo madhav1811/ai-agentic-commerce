@@ -1,0 +1,15 @@
+{
+  "name": "@aac/razorpay-client",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -b",
+    "typecheck": "tsc -b --noEmit false --emitDeclarationOnly false --dry"
+  },
+  "dependencies": {
+    "razorpay": "^2.9.4"
+  }
+}
