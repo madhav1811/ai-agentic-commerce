@@ -88,9 +88,9 @@ export class CheckoutService {
 
     const amount = resolved.reduce((sum, r) => sum + r.product.price * r.quantity, 0);
     const currency = this.catalog.merchant.currency;
-    const category = resolved[0]?.product.category ?? "unknown";
+    const items = resolved.map((r) => ({ name: r.product.name, category: r.product.category }));
 
-    const decision = await this.policy.evaluate({ actor: request.actor, amount, currency, category });
+    const decision = await this.policy.evaluate({ actor: request.actor, amount, currency, items });
     await this.auditLog.record({
       actor: request.actor,
       action: "policy_evaluated",

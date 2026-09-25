@@ -19,7 +19,8 @@ export interface CheckoutRequest {
   actor: string;
   amount: number;
   currency: string;
-  category: string;
+  /** Every line item in the cart. Each one's category is checked, not just the first. */
+  items: { name: string; category: string }[];
 }
 
 export interface PolicyDecision {
@@ -81,11 +82,18 @@ export class PolicyEngine {
       );
     }
 
-    if (!this.config.allowedCategories.includes(request.category)) {
+    if (request.items.length === 0) {
       allowed = false;
-      reasons.push(
-        `category "${request.category}" is not in the allowed list [${this.config.allowedCategories.join(", ")}]`
-      );
+      reasons.push("cart has no line items");
+    }
+
+    for (const item of request.items) {
+      if (!this.config.allowedCategories.includes(item.category)) {
+        allowed = false;
+        reasons.push(
+          `"${item.name}" is in category "${item.category}", which is not in the allowed list [${this.config.allowedCategories.join(", ")}]`
+        );
+      }
     }
 
     if (request.amount > this.config.maxOrderAmount) {
