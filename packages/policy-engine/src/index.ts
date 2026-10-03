@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
 /**
@@ -89,8 +89,13 @@ export class PolicyEngine {
   private async saveState(): Promise<void> {
     if (!this.state) return;
     const tmpPath = `${this.statePath}.tmp`;
-    await writeFile(tmpPath, JSON.stringify(this.state, null, 2), "utf8");
-    await rename(tmpPath, this.statePath);
+    try {
+      await writeFile(tmpPath, JSON.stringify(this.state, null, 2), "utf8");
+      await rename(tmpPath, this.statePath);
+    } catch (err) {
+      await rm(tmpPath, { force: true }).catch(() => undefined);
+      throw err;
+    }
   }
 
   private serialize<T>(fn: () => Promise<T>): Promise<T> {

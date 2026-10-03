@@ -27,7 +27,8 @@ const recommendRequestSchema = z.object({
  */
 function asyncRoute(handler: (req: Request, res: Response) => Promise<unknown>): RequestHandler {
   return (req, res, next) => {
-    handler(req, res).catch(next);
+    // `?? new Error(...)`: next() with no argument would fall through to a 404.
+    handler(req, res).catch((err) => next(err ?? new Error("route handler rejected without an error")));
   };
 }
 
@@ -117,12 +118,20 @@ export function createServer(service: CheckoutService) {
 
   // Last: turns any error (a rejected async route, a malformed JSON body) into
   // a JSON response instead of a hung request or a crashed server.
-  app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
-    const status = (err as { status?: number }).status ?? 500;
-    if (status >= 500) console.error("⚠️  request failed:", err);
+  app.use((err: unknown, _req: Request, res: Response, next: NextFunction) => {
+    // Too late to send an error body; let Express close the connection.
+    if (res.headersSent) return next(err);
+    const e = (err ?? {}) as { status?: unknown; expose?: unknown; message?: unknown };
+    const status = typeof e.status === "number" && e.status >= 400 && e.status < 600 ? e.status : 500;
+    if (status >= 500) {
+      // Details (file paths, internal state) go to the server log, never to the caller.
+      console.error("⚠️  request failed:", err);
+      return res.status(500).json({ error: "internal_error", message: "internal error; see the server logs" });
+    }
+    // Client errors such as malformed JSON: body-parser marks its messages safe to show with `expose`.
     res.status(status).json({
-      error: status >= 500 ? "internal_error" : "bad_request",
-      message: (err as Error)?.message ?? String(err),
+      error: "bad_request",
+      message: e.expose === true && typeof e.message === "string" ? e.message : "bad request",
     });
   });
 

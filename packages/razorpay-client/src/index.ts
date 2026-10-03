@@ -67,6 +67,17 @@ function isRazorpaySdkError(err: unknown): err is RazorpaySdkError {
 }
 
 /** The Node SDK rejects with a plain `{statusCode, error: {code, description}}` object, not an Error. */
+/**
+ * True if retrying the same call later could succeed: network failures (no
+ * HTTP status), rate limits (429) and Razorpay server errors (5xx). Other
+ * 4xx responses, such as 401 bad keys or 404 unknown id, won't fix themselves.
+ */
+export function isRetryableRazorpayError(err: unknown): boolean {
+  if (!isRazorpaySdkError(err)) return true;
+  const status = Number(err.statusCode);
+  return !Number.isFinite(status) || status === 429 || status >= 500;
+}
+
 export function describeRazorpayError(err: unknown): string {
   if (isRazorpaySdkError(err)) {
     return `${err.error.code}: ${err.error.description} (HTTP ${err.statusCode})`;

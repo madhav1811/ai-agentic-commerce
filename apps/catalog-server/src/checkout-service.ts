@@ -1,7 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { AuditLog, type AuditEntryInput } from "@aac/audit-log";
 import { PolicyEngine, SpendNotPersistedError, type PolicyDecision } from "@aac/policy-engine";
-import { RazorpayClient, describeRazorpayError, paymentIdFromLink } from "@aac/razorpay-client";
+import {
+  RazorpayClient,
+  describeRazorpayError,
+  isRetryableRazorpayError,
+  paymentIdFromLink,
+} from "@aac/razorpay-client";
 import { config, loadCatalog } from "./config.js";
 import { formatInr, rankProducts, type RecommendCriteria, type RankedProduct } from "./recommend.js";
 import type {
@@ -30,6 +35,12 @@ const SLOW_EXPIRY_CHECK_INTERVAL_MS = 15 * 60 * 1000;
 const SETTLED_RESULT_TTL_MS = 24 * 60 * 60 * 1000;
 /** A gated order nobody approves or denies within this long is expired and its hold released. */
 const APPROVAL_TTL_MS = 30 * 60 * 1000;
+/** An approval restored after a failed audit write gets at least this long for the operator to retry. */
+const MIN_RESTORED_APPROVAL_MS = 60 * 1000;
+/** How long an expired approval id is remembered, so a late approve/deny can say "expired". */
+const EXPIRED_APPROVAL_MEMORY_MS = 24 * 60 * 60 * 1000;
+/** Retry interval for a spend commit that failed before the spend was counted. */
+const COMMIT_RETRY_INTERVAL_MS = 60 * 1000;
 
 /**
  * Once an outcome is decided (Razorpay created an order, a link was paid or
@@ -49,6 +60,8 @@ interface PendingApproval {
   amount: number;
   currency: string;
   createdAt: string;
+  /** The approval's expiry timer, cleared on approve/deny so it doesn't linger for the full TTL. */
+  expiryTimer?: ReturnType<typeof setTimeout>;
 }
 
 interface PendingPayment {
@@ -71,6 +84,8 @@ export class CheckoutService {
   private policy: PolicyEngine;
   private razorpay: RazorpayClient;
   private pendingApprovals = new Map<string, PendingApproval>();
+  /** Recently expired approval ids, so a late approve/deny gets a clear reason. */
+  private expiredApprovals = new Set<string>();
   private pendingPayments = new Map<string, PendingPayment>();
   /**
    * Final outcome of every settled payment link, so repeat checks (e.g. a user
@@ -180,7 +195,8 @@ export class CheckoutService {
    * Turns a held order into a sale: stock leaves the shelf (synchronously) and
    * the spend moves from held to committed against the daily bound. The spend
    * is never left counted nowhere: if committing fails before it is counted,
-   * the hold keeps counting it until restart. Rejects so the caller can log.
+   * the hold keeps counting it while the commit is retried in the background
+   * (so it doesn't reduce the cap forever). Rejects so the caller can log.
    */
   private async settleHold(actor: string, lines: CartLine[], amount: number): Promise<void> {
     this.releaseStock(lines);
@@ -192,9 +208,32 @@ export class CheckoutService {
     } catch (err) {
       // Counted in memory, only the file write failed: the hold is no longer needed.
       if (err instanceof SpendNotPersistedError) this.policy.release(actor, amount);
+      else this.retryCommitLater(actor, amount);
       throw err;
     }
     this.policy.release(actor, amount);
+  }
+
+  /**
+   * Retries a spend commit that failed before counting (e.g. the state file was
+   * unreadable). Once it counts, the hold that stood in for it is released.
+   * Logs on the first retry and then hourly, not every minute.
+   */
+  private retryCommitLater(actor: string, amount: number, attempt = 1): void {
+    setTimeout(async () => {
+      try {
+        await this.policy.commitSpend(actor, amount);
+      } catch (err) {
+        if (!(err instanceof SpendNotPersistedError)) {
+          if (attempt === 1 || attempt % 60 === 0) {
+            console.error(`⚠️  daily-spend commit for "${actor}" still failing (retry ${attempt}): ${(err as Error).message}`);
+          }
+          this.retryCommitLater(actor, amount, attempt + 1);
+          return;
+        }
+      }
+      this.policy.release(actor, amount);
+    }, COMMIT_RETRY_INTERVAL_MS).unref();
   }
 
   /** An audit write after the outcome is decided: failures are logged, never thrown (see logWriteFailure). */
@@ -282,15 +321,10 @@ export class CheckoutService {
     if (decision.requiresGate) {
       // The hold stays in place while the order waits, so approval can't oversell or overspend.
       const approvalId = `appr_${randomUUID().replace(/-/g, "").slice(0, 16)}`;
-      this.pendingApprovals.set(approvalId, {
-        id: approvalId,
-        actor: request.actor,
-        items: lines,
-        amount,
-        currency,
-        createdAt: new Date().toISOString(),
-      });
-      setTimeout(() => void this.expireApproval(approvalId), APPROVAL_TTL_MS).unref();
+      this.trackApproval(
+        { id: approvalId, actor: request.actor, items: lines, amount, currency, createdAt: new Date().toISOString() },
+        APPROVAL_TTL_MS
+      );
       const reasons = [
         ...decision.reasons,
         `expires in ${APPROVAL_TTL_MS / 60000} minutes if no operator approves or denies it`,
@@ -317,12 +351,28 @@ export class CheckoutService {
     return this.captureOrder(request.actor, lines, amount, currency);
   }
 
+  private trackApproval(pending: PendingApproval, ttlMs: number): void {
+    pending.expiryTimer = setTimeout(() => void this.expireApproval(pending.id), ttlMs);
+    pending.expiryTimer.unref();
+    this.pendingApprovals.set(pending.id, pending);
+  }
+
+  private untrackApproval(pending: PendingApproval): void {
+    clearTimeout(pending.expiryTimer);
+    this.pendingApprovals.delete(pending.id);
+  }
+
+  private noPendingApproval(approvalId: string): CheckoutResult {
+    const reason = this.expiredApprovals.has(approvalId)
+      ? `approval "${approvalId}" expired after ${APPROVAL_TTL_MS / 60000} minutes without a decision and its hold was released; resubmit the checkout`
+      : `no pending approval with id "${approvalId}"`;
+    return { status: "declined", reasons: [reason] };
+  }
+
   async approve(approvalId: string, approvedBy: string): Promise<CheckoutResult> {
     const pending = this.pendingApprovals.get(approvalId);
-    if (!pending) {
-      return { status: "declined", reasons: [`no pending approval with id "${approvalId}"`] };
-    }
-    this.pendingApprovals.delete(approvalId);
+    if (!pending) return this.noPendingApproval(approvalId);
+    this.untrackApproval(pending);
     try {
       await this.auditLog.record({
         actor: pending.actor,
@@ -335,8 +385,10 @@ export class CheckoutService {
       });
     } catch (err) {
       // No money moves without a record of the approval. Put it back (hold
-      // intact) so the operator can retry once the audit log is writable.
-      this.pendingApprovals.set(approvalId, pending);
+      // intact, with a fresh expiry for whatever time it had left) so the
+      // operator can retry once the audit log is writable.
+      const remainingMs = Date.parse(pending.createdAt) + APPROVAL_TTL_MS - Date.now();
+      this.trackApproval(pending, Math.max(remainingMs, MIN_RESTORED_APPROVAL_MS));
       throw err;
     }
 
@@ -369,10 +421,8 @@ export class CheckoutService {
 
   async deny(approvalId: string, deniedBy: string, reason: string): Promise<CheckoutResult> {
     const pending = this.pendingApprovals.get(approvalId);
-    if (!pending) {
-      return { status: "declined", reasons: [`no pending approval with id "${approvalId}"`] };
-    }
-    this.pendingApprovals.delete(approvalId);
+    if (!pending) return this.noPendingApproval(approvalId);
+    this.untrackApproval(pending);
     this.releaseHold(pending.actor, pending.items, pending.amount);
     await this.recordOutcome(`approval ${approvalId}`, {
       actor: pending.actor,
@@ -390,8 +440,10 @@ export class CheckoutService {
   private async expireApproval(approvalId: string): Promise<void> {
     const pending = this.pendingApprovals.get(approvalId);
     if (!pending) return;
-    this.pendingApprovals.delete(approvalId);
+    this.untrackApproval(pending);
     this.releaseHold(pending.actor, pending.items, pending.amount);
+    this.expiredApprovals.add(approvalId);
+    setTimeout(() => this.expiredApprovals.delete(approvalId), EXPIRED_APPROVAL_MEMORY_MS).unref();
     await this.recordOutcome(`approval ${approvalId}`, {
       actor: pending.actor,
       action: "gate_expired",
@@ -410,26 +462,41 @@ export class CheckoutService {
    * Once settled, every later check returns that same outcome.
    */
   async checkPayment(paymentLinkId: string): Promise<CheckoutResult> {
+    return (await this.checkPaymentDetailed(paymentLinkId)).result;
+  }
+
+  /**
+   * `retryable` is false once checking again can't help: the link is settled
+   * or unknown, or Razorpay rejected the lookup itself (e.g. 401 bad keys,
+   * 404 unknown link) rather than being unreachable.
+   */
+  private async checkPaymentDetailed(paymentLinkId: string): Promise<{ result: CheckoutResult; retryable: boolean }> {
     const settled = this.settledPayments.get(paymentLinkId);
-    if (settled) return settled;
+    if (settled) return { result: await settled, retryable: false };
 
     const pending = this.pendingPayments.get(paymentLinkId);
     if (!pending) {
-      return { status: "declined", reasons: [`no payment awaiting confirmation with id "${paymentLinkId}"`] };
+      return {
+        result: { status: "declined", reasons: [`no payment awaiting confirmation with id "${paymentLinkId}"`] },
+        retryable: false,
+      };
     }
 
     let link;
     try {
       link = await this.razorpay.fetchPaymentLink(paymentLinkId);
     } catch (err) {
-      return this.pendingPaymentResult(pending, [
-        `could not reach Razorpay to check this payment: ${describeRazorpayError(err)}`,
-      ]);
+      return {
+        result: this.pendingPaymentResult(pending, [
+          `could not check this payment with Razorpay: ${describeRazorpayError(err)}`,
+        ]),
+        retryable: isRetryableRazorpayError(err),
+      };
     }
 
     // Another check may have settled it while we were waiting on Razorpay.
     const settledMeanwhile = this.settledPayments.get(paymentLinkId);
-    if (settledMeanwhile) return settledMeanwhile;
+    if (settledMeanwhile) return { result: await settledMeanwhile, retryable: false };
 
     if (link.status === "paid" || link.status === "expired" || link.status === "cancelled") {
       // Recorded synchronously, before any await, so exactly one check settles the link.
@@ -440,10 +507,13 @@ export class CheckoutService {
           : this.settleUnpaid(pending, link.status);
       this.settledPayments.set(paymentLinkId, settlement);
       setTimeout(() => this.settledPayments.delete(paymentLinkId), SETTLED_RESULT_TTL_MS).unref();
-      return settlement;
+      return { result: await settlement, retryable: false };
     }
 
-    return this.pendingPaymentResult(pending, [`payment link is "${link.status}"; not paid yet`]);
+    return {
+      result: this.pendingPaymentResult(pending, [`payment link is "${link.status}"; not paid yet`]),
+      retryable: true,
+    };
   }
 
   /**
@@ -452,17 +522,27 @@ export class CheckoutService {
    * if nobody polls. After MAX_EXPIRY_CHECKS it slows down rather than stops:
    * the hold is never released without Razorpay's word (that could oversell a
    * paid order), so a long Razorpay outage still settles once it recovers.
+   * It stops when Razorpay rejects the lookup itself (bad keys, unknown
+   * link): retrying can't fix that, so it logs what the operator must do.
    * `unref` keeps the timer from holding the process open.
    */
   private scheduleExpiryCheck(paymentLinkId: string, delayMs: number, attempt = 1): void {
     setTimeout(async () => {
-      let result: CheckoutResult | undefined;
+      let check: { result: CheckoutResult; retryable: boolean } | undefined;
       try {
-        result = await this.checkPayment(paymentLinkId);
+        check = await this.checkPaymentDetailed(paymentLinkId);
       } catch (err) {
         console.error(`⚠️  expiry check ${attempt} for payment link ${paymentLinkId} failed: ${(err as Error).message}`);
       }
-      if (result && result.status !== "pending_payment") return;
+      if (check && check.result.status !== "pending_payment") return;
+      if (check && !check.retryable) {
+        const reason = check.result.status === "pending_payment" ? check.result.reasons.join("; ") : "";
+        console.error(
+          `⚠️  payment link ${paymentLinkId}: stopped automatic checks (${reason}). Its hold stays until ` +
+            `GET /payments/${paymentLinkId} succeeds (e.g. after fixing the Razorpay keys) or the server restarts`
+        );
+        return;
+      }
       if (attempt === MAX_EXPIRY_CHECKS) {
         console.error(
           `⚠️  payment link ${paymentLinkId} still unsettled after ${attempt} expiry checks; ` +
@@ -560,7 +640,7 @@ export class CheckoutService {
     }
 
     const subject = `order ${order.id}`;
-    await this.recordOutcome(subject, {
+    const orderCreated: AuditEntryInput = {
       actor,
       action: "order_created",
       amount,
@@ -568,7 +648,20 @@ export class CheckoutService {
       orderId: order.id,
       status: "success",
       reasons: ["Razorpay test-mode order created"],
-    });
+    };
+    if (config.paymentMode === "real_payment_link") {
+      // Nothing is captured here, and the buyer needs the link: log and go on.
+      await this.recordOutcome(subject, orderCreated);
+    } else {
+      // Simulated capture moves stock immediately, so this is the last record
+      // before money moves: if it can't be written, nothing is captured.
+      try {
+        await this.auditLog.record(orderCreated);
+      } catch (err) {
+        this.releaseHold(actor, items, amount);
+        throw err;
+      }
+    }
 
     if (config.paymentMode === "real_payment_link") {
       let link;
