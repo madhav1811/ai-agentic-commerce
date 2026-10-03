@@ -46,7 +46,8 @@ export class SpendNotPersistedError extends Error {
   }
 }
 
-function todayKey(): string {
+/** The policy day (UTC date) a spend counts against. */
+export function todayKey(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
@@ -181,16 +182,23 @@ export class PolicyEngine {
    * daily bound. Counts in memory first, then saves. Rejects with
    * `SpendNotPersistedError` if only the save failed (the spend still counts
    * for this process); any other rejection means it was not counted.
+   *
+   * `saleDay` is the day the payment captured (from `todayKey()` at that
+   * moment). A commit retried after that day has ended resolves `false`
+   * without counting: it belonged to a day whose cap no longer applies, and
+   * must not eat into today's.
    */
-  commitSpend(actor: string, amount: number): Promise<void> {
+  commitSpend(actor: string, amount: number, saleDay: string = todayKey()): Promise<boolean> {
     return this.serialize(async () => {
       const state = await this.loadState();
+      if (state.date !== saleDay) return false;
       state.spendByActor[actor] = (state.spendByActor[actor] ?? 0) + amount;
       try {
         await this.saveState();
       } catch (err) {
         throw new SpendNotPersistedError(err);
       }
+      return true;
     });
   }
 
