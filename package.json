@@ -12,6 +12,7 @@
     "typecheck": "npm run typecheck --workspaces --if-present",
     "dev:catalog": "npm run dev --workspace=@aac/catalog-server",
     "dev:agent": "npm run dev --workspace=@aac/buyer-agent",
+    "dev:agent-ui": "npm run dev:ui --workspace=@aac/buyer-agent",
     "demo": "npm run build && node apps/buyer-agent/dist/index.js"
   },
   "devDependencies": {

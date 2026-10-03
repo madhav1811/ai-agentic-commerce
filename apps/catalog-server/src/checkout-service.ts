@@ -4,7 +4,7 @@ import { PolicyEngine } from "@aac/policy-engine";
 import { RazorpayClient, describeRazorpayError } from "@aac/razorpay-client";
 import { config, loadCatalog } from "./config.js";
 import { formatInr, rankProducts, type RecommendCriteria, type RankedProduct } from "./recommend.js";
-import type { Catalog, CheckoutRequestBody, CheckoutResult, Product } from "./types.js";
+import type { Catalog, CheckoutRequestBody, CheckoutResult, Product, UpsellSuggestion } from "./types.js";
 
 interface PendingApproval {
   id: string;
@@ -45,6 +45,29 @@ export class CheckoutService {
     return this.catalog.products.find(
       (p) => p.category === outOfStock.category && p.stock > 0 && p.id !== outOfStock.id
     );
+  }
+
+  /**
+   * Deterministic cross-sell: each product's own `upsellWith` pairing, filtered
+   * to in-stock items not already in the cart. Never delegated to the LLM, same
+   * as recommend.ts — the reason quotes the real product that earned the pairing.
+   */
+  private suggestUpsells(purchased: { product: Product; quantity: number }[]): UpsellSuggestion[] {
+    const purchasedIds = new Set(purchased.map((p) => p.product.id));
+    const suggestions = new Map<string, UpsellSuggestion>();
+    for (const { product } of purchased) {
+      for (const upsellId of product.upsellWith) {
+        if (purchasedIds.has(upsellId) || suggestions.has(upsellId)) continue;
+        const upsellProduct = this.getProduct(upsellId);
+        if (!upsellProduct || upsellProduct.stock <= 0) continue;
+        suggestions.set(upsellId, {
+          product: upsellProduct,
+          reason: `frequently bought with "${product.name}"`,
+          priceDisplay: formatInr(upsellProduct.price),
+        });
+      }
+    }
+    return [...suggestions.values()];
   }
 
   async requestCheckout(request: CheckoutRequestBody): Promise<CheckoutResult> {
@@ -234,6 +257,7 @@ export class CheckoutService {
         amountDisplay: formatInr(amount),
         currency,
         simulated: false,
+        upsell: this.suggestUpsells(items),
       };
     }
 
@@ -261,6 +285,7 @@ export class CheckoutService {
       amountDisplay: formatInr(amount),
       currency,
       simulated: true,
+      upsell: this.suggestUpsells(items),
     };
   }
 }

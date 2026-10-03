@@ -7,9 +7,14 @@
   "scripts": {
     "build": "tsc -b",
     "typecheck": "tsc -b --noEmit false --emitDeclarationOnly false --dry",
-    "dev": "tsx src/index.ts"
+    "dev": "tsx src/index.ts",
+    "dev:ui": "tsx src/web-server.ts"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
   },
   "devDependencies": {
+    "@types/express": "^4.17.21",
     "@types/node": "^20.14.9",
     "tsx": "^4.16.2"
   }

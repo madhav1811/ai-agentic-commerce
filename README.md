@@ -71,6 +71,7 @@ no matter which protocol the buyer used.
 | **Gated** | Orders at or above a threshold return `pending_approval` instead of capturing. Approval requires a token only the merchant operator holds — the buyer agent has no tool that can call `/checkout/:id/approve`, so it cannot approve its own spend (`apps/buyer-agent/src/operator.ts`). |
 | **Audit trail** | Every decision (`checkout_requested`, `policy_evaluated`, `gate_required`, `gate_approved`, `order_created`, `payment_captured`/`payment_failed`, `checkout_declined`) is appended to a **hash-chained** JSONL log — tampering with any past entry breaks every hash after it. View it live at `/dashboard` (`packages/audit-log/src/index.ts`). |
 | **One failure handled gracefully** | Out-of-stock at checkout time returns a clear decline *and* a same-category in-stock substitute, fully logged — not a crash, not a silent retry. A second, real failure path is also wired end to end: a genuine Razorpay API rejection (bad/expired test keys, network error) is caught, described in plain English, and logged as `payment_failed` rather than throwing. |
+| **Cross-sell** | Every successful `checkout` carries an `upsell[]` array, deterministically derived from each purchased product's own `upsellWith` pairing (in-stock, not already in the cart), each with a plain-English reason and a pre-formatted price — never invented by the LLM (`apps/catalog-server/src/checkout-service.ts`). The buyer-agent offers the top entry as a one-line follow-up after every capture. |
 
 ## What's real vs. simulated (read this before demoing)
 
@@ -152,11 +153,9 @@ and point any MCP client at that stdio process.
 
 ## Roadmap (not built yet)
 
-The brief's other three directions are natural next phases on top of the same
+The brief's other two directions are natural next phases on top of the same
 `CheckoutService`/policy/audit core:
 
-- **Upsell & cross-sell agent** — the catalog already carries `upsellWith` pairings per product;
-  wiring a proactive suggestion pass onto `create_checkout` is the next step.
 - **Conversational in-app checkout** — swap the CLI buyer-agent's I/O for a chat UI; the tool-use
   loop underneath doesn't change.
 - **Campaign orchestrator** — a scheduled agent that proposes bounded, gated discount campaigns

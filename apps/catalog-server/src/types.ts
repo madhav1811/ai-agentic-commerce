@@ -33,6 +33,12 @@ export interface CheckoutRequestBody {
   items: CheckoutItem[];
 }
 
+export interface UpsellSuggestion {
+  product: Product;
+  reason: string;
+  priceDisplay: string;
+}
+
 export type CheckoutResult =
   | { status: "declined"; reasons: string[]; suggestion?: Product }
   | {
@@ -51,5 +57,6 @@ export type CheckoutResult =
       amountDisplay: string;
       currency: string;
       simulated: boolean;
+      upsell: UpsellSuggestion[];
     }
   | { status: "payment_failed"; orderId: string; reasons: string[] };

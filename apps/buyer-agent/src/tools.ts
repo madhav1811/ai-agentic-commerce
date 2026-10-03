@@ -62,7 +62,9 @@ export const tools: ToolDef[] = [
         "Attempt to buy one or more products. This call is bounded (max order amount, daily spend cap, " +
         "allowed categories) and may pause for human approval if it crosses the merchant's gate threshold — " +
         "you will only ever see the final outcome (captured, declined, or payment_failed) with `reasons` " +
-        "explaining the decision. You cannot approve your own gated checkout.",
+        "explaining the decision. You cannot approve your own gated checkout. On status 'captured', the " +
+        "response includes an `upsell` array of real, in-stock, frequently-paired products (each with its " +
+        "own priceDisplay and reason) — never invent an upsell yourself, only offer what's actually there.",
       parameters: {
         type: "object",
         properties: {

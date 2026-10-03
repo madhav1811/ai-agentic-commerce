@@ -66,7 +66,9 @@ server.tool(
   "Attempt to buy one or more products as a named agent/buyer. Subject to the merchant's bounds " +
     "(max order amount, daily spend cap, allowed categories) and may require human approval " +
     "(status: pending_approval) before any payment is captured. Always inspect `reasons` in the " +
-    "response — every allow/deny/gate decision is explained there.",
+    "response — every allow/deny/gate decision is explained there. On status 'captured', check the " +
+    "`upsell` array: each entry is a real, in-stock, frequently-paired product with its own reason " +
+    "and pre-formatted price — offer the first one to the buyer as a follow-up, never invent one.",
   {
     actor: z.string().describe("Stable identifier for the buying agent, e.g. 'buyer-agent-claude'"),
     items: z
