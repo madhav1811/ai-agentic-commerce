@@ -59,4 +59,15 @@ export type CheckoutResult =
       simulated: boolean;
       upsell: UpsellSuggestion[];
     }
+  | {
+      /** A real payment link was issued; nothing is captured until a human pays it. */
+      status: "pending_payment";
+      orderId: string;
+      paymentLinkId: string;
+      paymentUrl: string;
+      amount: number;
+      amountDisplay: string;
+      currency: string;
+      reasons: string[];
+    }
   | { status: "payment_failed"; orderId: string; reasons: string[] };

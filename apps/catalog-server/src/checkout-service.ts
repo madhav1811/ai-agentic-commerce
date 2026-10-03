@@ -1,19 +1,45 @@
 import { randomUUID } from "node:crypto";
 import { AuditLog } from "@aac/audit-log";
-import { PolicyEngine } from "@aac/policy-engine";
-import { RazorpayClient, describeRazorpayError } from "@aac/razorpay-client";
+import { PolicyEngine, type PolicyDecision } from "@aac/policy-engine";
+import { RazorpayClient, describeRazorpayError, paymentIdFromLink } from "@aac/razorpay-client";
 import { config, loadCatalog } from "./config.js";
 import { formatInr, rankProducts, type RecommendCriteria, type RankedProduct } from "./recommend.js";
-import type { Catalog, CheckoutRequestBody, CheckoutResult, Product, UpsellSuggestion } from "./types.js";
+import type {
+  Catalog,
+  CheckoutItem,
+  CheckoutRequestBody,
+  CheckoutResult,
+  Product,
+  UpsellSuggestion,
+} from "./types.js";
+
+type CartLine = { product: Product; quantity: number };
+
+/** Payment links expire after this long, so an abandoned link eventually releases its hold. */
+const PAYMENT_LINK_TTL_SECONDS = 30 * 60;
 
 interface PendingApproval {
   id: string;
   actor: string;
-  items: { product: Product; quantity: number }[];
+  items: CartLine[];
   amount: number;
   currency: string;
   createdAt: string;
 }
+
+interface PendingPayment {
+  paymentLinkId: string;
+  paymentUrl: string;
+  orderId: string;
+  actor: string;
+  items: CartLine[];
+  amount: number;
+  currency: string;
+}
+
+type HoldResult =
+  | { ok: true; lines: CartLine[]; amount: number; currency: string; decision: PolicyDecision }
+  | { ok: false; result: CheckoutResult };
 
 export class CheckoutService {
   readonly catalog: Catalog;
@@ -21,6 +47,15 @@ export class CheckoutService {
   private policy: PolicyEngine;
   private razorpay: RazorpayClient;
   private pendingApprovals = new Map<string, PendingApproval>();
+  private pendingPayments = new Map<string, PendingPayment>();
+  /** Units held by in-flight orders (awaiting approval or payment), per product id. */
+  private reservedStock = new Map<string, number>();
+  /**
+   * Tail of the decision queue. Stock and policy checks plus the hold they
+   * place run one checkout at a time, so two concurrent checkouts can't both
+   * claim the last unit or the last of an agent's daily cap.
+   */
+  private decisionQueue: Promise<unknown> = Promise.resolve();
 
   constructor() {
     this.catalog = loadCatalog();
@@ -41,9 +76,14 @@ export class CheckoutService {
     return rankProducts(this.catalog.products, criteria);
   }
 
+  /** Stock not already held by an in-flight order. */
+  private available(product: Product): number {
+    return product.stock - (this.reservedStock.get(product.id) ?? 0);
+  }
+
   private suggestSubstitute(outOfStock: Product): Product | undefined {
     return this.catalog.products.find(
-      (p) => p.category === outOfStock.category && p.stock > 0 && p.id !== outOfStock.id
+      (p) => p.category === outOfStock.category && this.available(p) > 0 && p.id !== outOfStock.id
     );
   }
 
@@ -52,14 +92,14 @@ export class CheckoutService {
    * to in-stock items not already in the cart. Never delegated to the LLM, same
    * as recommend.ts — the reason quotes the real product that earned the pairing.
    */
-  private suggestUpsells(purchased: { product: Product; quantity: number }[]): UpsellSuggestion[] {
+  private suggestUpsells(purchased: CartLine[]): UpsellSuggestion[] {
     const purchasedIds = new Set(purchased.map((p) => p.product.id));
     const suggestions = new Map<string, UpsellSuggestion>();
     for (const { product } of purchased) {
       for (const upsellId of product.upsellWith) {
         if (purchasedIds.has(upsellId) || suggestions.has(upsellId)) continue;
         const upsellProduct = this.getProduct(upsellId);
-        if (!upsellProduct || upsellProduct.stock <= 0) continue;
+        if (!upsellProduct || this.available(upsellProduct) <= 0) continue;
         suggestions.set(upsellId, {
           product: upsellProduct,
           reason: `frequently bought with "${product.name}"`,
@@ -68,6 +108,98 @@ export class CheckoutService {
       }
     }
     return [...suggestions.values()];
+  }
+
+  private serialize<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.decisionQueue.then(fn);
+    this.decisionQueue = run.catch(() => undefined);
+    return run;
+  }
+
+  private hold(actor: string, lines: CartLine[], amount: number): void {
+    for (const { product, quantity } of lines) {
+      this.reservedStock.set(product.id, (this.reservedStock.get(product.id) ?? 0) + quantity);
+    }
+    this.policy.reserve(actor, amount);
+  }
+
+  private releaseHold(actor: string, lines: CartLine[], amount: number): void {
+    for (const { product, quantity } of lines) {
+      const remaining = (this.reservedStock.get(product.id) ?? 0) - quantity;
+      if (remaining > 0) this.reservedStock.set(product.id, remaining);
+      else this.reservedStock.delete(product.id);
+    }
+    this.policy.release(actor, amount);
+  }
+
+  /** Turns a held order into a sale: stock leaves the shelf and spend counts against the daily bound. */
+  private async settleHold(actor: string, lines: CartLine[], amount: number): Promise<void> {
+    this.releaseHold(actor, lines, amount);
+    for (const { product, quantity } of lines) {
+      product.stock -= quantity;
+    }
+    await this.policy.commitSpend(actor, amount);
+  }
+
+  /**
+   * Validates stock and policy for a cart and, if allowed, holds the stock and
+   * spend so nothing else can claim them. Must run inside `serialize`.
+   */
+  private async checkAndHold(actor: string, items: CheckoutItem[], context?: string): Promise<HoldResult> {
+    const lines: CartLine[] = [];
+    // Totals per product, so two lines for the same product can't each pass on their own.
+    const requested = new Map<string, number>();
+    for (const item of items) {
+      const product = this.getProduct(item.productId);
+      if (!product) {
+        await this.auditLog.record({
+          actor,
+          action: "checkout_declined",
+          status: "denied",
+          reasons: [`unknown product id "${item.productId}"`],
+        });
+        return { ok: false, result: { status: "declined", reasons: [`unknown product id "${item.productId}"`] } };
+      }
+      const total = (requested.get(product.id) ?? 0) + item.quantity;
+      requested.set(product.id, total);
+      const available = this.available(product);
+      if (available < total) {
+        const suggestion = this.suggestSubstitute(product);
+        const reasons = [`"${product.name}" is out of stock (requested ${total}, available ${available})`];
+        if (context) reasons.unshift(context);
+        if (suggestion) reasons.push(`suggested substitute: "${suggestion.name}" (${suggestion.id})`);
+        await this.auditLog.record({
+          actor,
+          action: "checkout_declined",
+          status: "denied",
+          reasons,
+          details: { outOfStockProductId: product.id, suggestionId: suggestion?.id },
+        });
+        return { ok: false, result: { status: "declined", reasons, suggestion } };
+      }
+      lines.push({ product, quantity: item.quantity });
+    }
+
+    const amount = lines.reduce((sum, r) => sum + r.product.price * r.quantity, 0);
+    const currency = this.catalog.merchant.currency;
+    const policyItems = lines.map((r) => ({ name: r.product.name, category: r.product.category }));
+
+    const decision = await this.policy.evaluate({ actor, amount, currency, items: policyItems });
+    await this.auditLog.record({
+      actor,
+      action: "policy_evaluated",
+      amount,
+      currency,
+      status: decision.allowed ? "allowed" : "denied",
+      reasons: context ? [context, ...decision.reasons] : decision.reasons,
+    });
+
+    if (!decision.allowed) {
+      return { ok: false, result: { status: "declined", reasons: decision.reasons } };
+    }
+
+    this.hold(actor, lines, amount);
+    return { ok: true, lines, amount, currency, decision };
   }
 
   async requestCheckout(request: CheckoutRequestBody): Promise<CheckoutResult> {
@@ -79,60 +211,17 @@ export class CheckoutService {
       details: { items: request.items },
     });
 
-    const resolved: { product: Product; quantity: number }[] = [];
-    for (const item of request.items) {
-      const product = this.getProduct(item.productId);
-      if (!product) {
-        await this.auditLog.record({
-          actor: request.actor,
-          action: "checkout_declined",
-          status: "denied",
-          reasons: [`unknown product id "${item.productId}"`],
-        });
-        return { status: "declined", reasons: [`unknown product id "${item.productId}"`] };
-      }
-      if (product.stock < item.quantity) {
-        const suggestion = this.suggestSubstitute(product);
-        const reasons = [
-          `"${product.name}" is out of stock (requested ${item.quantity}, available ${product.stock})`,
-        ];
-        if (suggestion) reasons.push(`suggested substitute: "${suggestion.name}" (${suggestion.id})`);
-        await this.auditLog.record({
-          actor: request.actor,
-          action: "checkout_declined",
-          status: "denied",
-          reasons,
-          details: { outOfStockProductId: product.id, suggestionId: suggestion?.id },
-        });
-        return { status: "declined", reasons, suggestion };
-      }
-      resolved.push({ product, quantity: item.quantity });
-    }
-
-    const amount = resolved.reduce((sum, r) => sum + r.product.price * r.quantity, 0);
-    const currency = this.catalog.merchant.currency;
-    const items = resolved.map((r) => ({ name: r.product.name, category: r.product.category }));
-
-    const decision = await this.policy.evaluate({ actor: request.actor, amount, currency, items });
-    await this.auditLog.record({
-      actor: request.actor,
-      action: "policy_evaluated",
-      amount,
-      currency,
-      status: decision.allowed ? "allowed" : "denied",
-      reasons: decision.reasons,
-    });
-
-    if (!decision.allowed) {
-      return { status: "declined", reasons: decision.reasons };
-    }
+    const check = await this.serialize(() => this.checkAndHold(request.actor, request.items));
+    if (!check.ok) return check.result;
+    const { lines, amount, currency, decision } = check;
 
     if (decision.requiresGate) {
+      // The hold stays in place while the order waits, so approval can't oversell or overspend.
       const approvalId = `appr_${randomUUID().replace(/-/g, "").slice(0, 16)}`;
       this.pendingApprovals.set(approvalId, {
         id: approvalId,
         actor: request.actor,
-        items: resolved,
+        items: lines,
         amount,
         currency,
         createdAt: new Date().toISOString(),
@@ -156,7 +245,7 @@ export class CheckoutService {
       };
     }
 
-    return this.captureOrder(request.actor, resolved, amount, currency);
+    return this.captureOrder(request.actor, lines, amount, currency);
   }
 
   async approve(approvalId: string, approvedBy: string): Promise<CheckoutResult> {
@@ -174,7 +263,27 @@ export class CheckoutService {
       reasons: [`approved by ${approvedBy}`],
       details: { approvalId },
     });
-    return this.captureOrder(pending.actor, pending.items, pending.amount, pending.currency);
+
+    // Approval is a human's yes to *this* order, not a bypass: re-run stock and
+    // policy against current state (bounds or the day may have changed) before
+    // any money moves. Release-then-recheck runs as one step so nothing slips in between.
+    const check = await this.serialize(async () => {
+      this.releaseHold(pending.actor, pending.items, pending.amount);
+      const items = pending.items.map((l) => ({ productId: l.product.id, quantity: l.quantity }));
+      return this.checkAndHold(pending.actor, items, `re-checked at approval time (${approvalId})`);
+    });
+    if (!check.ok) return check.result;
+
+    if (check.amount !== pending.amount) {
+      this.releaseHold(pending.actor, check.lines, check.amount);
+      const reasons = [
+        `order total changed from ${formatInr(pending.amount)} to ${formatInr(check.amount)} since it was approved; resubmit for a fresh approval`,
+      ];
+      await this.auditLog.record({ actor: pending.actor, action: "checkout_declined", status: "denied", reasons });
+      return { status: "declined", reasons };
+    }
+
+    return this.captureOrder(pending.actor, check.lines, check.amount, check.currency);
   }
 
   async deny(approvalId: string, deniedBy: string, reason: string): Promise<CheckoutResult> {
@@ -183,6 +292,7 @@ export class CheckoutService {
       return { status: "declined", reasons: [`no pending approval with id "${approvalId}"`] };
     }
     this.pendingApprovals.delete(approvalId);
+    this.releaseHold(pending.actor, pending.items, pending.amount);
     await this.auditLog.record({
       actor: pending.actor,
       action: "gate_denied",
@@ -195,9 +305,96 @@ export class CheckoutService {
     return { status: "declined", reasons: [`denied by ${deniedBy}: ${reason}`] };
   }
 
+  /**
+   * Polls Razorpay for a payment link issued in `real_payment_link` mode and
+   * settles it: "paid" captures (stock and spend committed), "expired" or
+   * "cancelled" fails and releases the hold, anything else is still pending.
+   */
+  async checkPayment(paymentLinkId: string): Promise<CheckoutResult> {
+    const pending = this.pendingPayments.get(paymentLinkId);
+    if (!pending) {
+      return { status: "declined", reasons: [`no payment awaiting confirmation with id "${paymentLinkId}"`] };
+    }
+
+    let link;
+    try {
+      link = await this.razorpay.fetchPaymentLink(paymentLinkId);
+    } catch (err) {
+      return this.pendingPaymentResult(pending, [
+        `could not reach Razorpay to check this payment: ${describeRazorpayError(err)}`,
+      ]);
+    }
+
+    // Another check may have settled it while we were waiting on Razorpay.
+    if (this.pendingPayments.get(paymentLinkId) !== pending) {
+      return { status: "declined", reasons: [`payment "${paymentLinkId}" was already settled`] };
+    }
+
+    const { actor, items, amount, currency, orderId } = pending;
+
+    if (link.status === "paid") {
+      this.pendingPayments.delete(paymentLinkId);
+      await this.settleHold(actor, items, amount);
+      const paymentId = paymentIdFromLink(link) ?? paymentLinkId;
+      await this.auditLog.record({
+        actor,
+        action: "payment_captured",
+        amount,
+        currency,
+        orderId,
+        status: "success",
+        reasons: ["real Razorpay test-mode payment captured via payment link"],
+        details: { paymentLinkId, paymentId, simulated: false },
+      });
+      return {
+        status: "captured",
+        orderId,
+        paymentId,
+        amount,
+        amountDisplay: formatInr(amount),
+        currency,
+        simulated: false,
+        upsell: this.suggestUpsells(items),
+      };
+    }
+
+    if (link.status === "expired" || link.status === "cancelled") {
+      this.pendingPayments.delete(paymentLinkId);
+      this.releaseHold(actor, items, amount);
+      const reasons = [`payment link ${link.status} before it was paid; nothing was charged`];
+      await this.auditLog.record({
+        actor,
+        action: "payment_failed",
+        amount,
+        currency,
+        orderId,
+        status: "failure",
+        reasons,
+        details: { paymentLinkId },
+      });
+      return { status: "payment_failed", orderId, reasons };
+    }
+
+    return this.pendingPaymentResult(pending, [`payment link is "${link.status}"; not paid yet`]);
+  }
+
+  private pendingPaymentResult(pending: PendingPayment, reasons: string[]): CheckoutResult {
+    return {
+      status: "pending_payment",
+      orderId: pending.orderId,
+      paymentLinkId: pending.paymentLinkId,
+      paymentUrl: pending.paymentUrl,
+      amount: pending.amount,
+      amountDisplay: formatInr(pending.amount),
+      currency: pending.currency,
+      reasons,
+    };
+  }
+
+  /** Expects the caller to already hold `items`/`amount`; every exit path settles or releases that hold. */
   private async captureOrder(
     actor: string,
-    items: { product: Product; quantity: number }[],
+    items: CartLine[],
     amount: number,
     currency: string
   ): Promise<CheckoutResult> {
@@ -210,6 +407,7 @@ export class CheckoutService {
         notes: { actor, itemIds: items.map((i) => i.product.id).join(",") },
       });
     } catch (err) {
+      this.releaseHold(actor, items, amount);
       const message = describeRazorpayError(err);
       await this.auditLog.record({
         actor,
@@ -233,39 +431,60 @@ export class CheckoutService {
     });
 
     if (config.paymentMode === "real_payment_link") {
-      const link = await this.razorpay.createPaymentLink({
+      let link;
+      try {
+        link = await this.razorpay.createPaymentLink({
+          amount,
+          currency,
+          description: items.map((i) => `${i.quantity}x ${i.product.name}`).join(", "),
+          referenceId: order.id,
+          expireBy: Math.floor(Date.now() / 1000) + PAYMENT_LINK_TTL_SECONDS,
+        });
+      } catch (err) {
+        this.releaseHold(actor, items, amount);
+        const message = describeRazorpayError(err);
+        await this.auditLog.record({
+          actor,
+          action: "payment_failed",
+          amount,
+          currency,
+          orderId: order.id,
+          status: "failure",
+          reasons: [`Razorpay payment link creation failed: ${message}`],
+        });
+        return { status: "payment_failed", orderId: order.id, reasons: [`payment link creation failed: ${message}`] };
+      }
+
+      // Nothing is captured yet: the hold stays until checkPayment sees the link paid, expired or cancelled.
+      const pending: PendingPayment = {
+        paymentLinkId: link.id,
+        paymentUrl: link.short_url,
+        orderId: order.id,
+        actor,
+        items,
         amount,
         currency,
-        description: items.map((i) => `${i.quantity}x ${i.product.name}`).join(", "),
-        referenceId: order.id,
-      });
+      };
+      this.pendingPayments.set(link.id, pending);
+      const reasons = [
+        "real Razorpay payment link issued; nothing is captured until a human pays it",
+        `link expires in ${PAYMENT_LINK_TTL_SECONDS / 60} minutes`,
+      ];
       await this.auditLog.record({
         actor,
-        action: "payment_captured",
+        action: "payment_pending",
         amount,
         currency,
         orderId: order.id,
         status: "pending",
-        reasons: ["real Razorpay payment link issued; awaiting human payment"],
+        reasons,
         details: { paymentLinkUrl: link.short_url, paymentLinkId: link.id },
       });
-      return {
-        status: "captured",
-        orderId: order.id,
-        paymentId: link.id,
-        amount,
-        amountDisplay: formatInr(amount),
-        currency,
-        simulated: false,
-        upsell: this.suggestUpsells(items),
-      };
+      return this.pendingPaymentResult(pending, reasons);
     }
 
     const payment = this.razorpay.simulateCapture(order.id, amount, currency);
-    for (const { product, quantity } of items) {
-      product.stock -= quantity;
-    }
-    await this.policy.commitSpend(actor, amount);
+    await this.settleHold(actor, items, amount);
     await this.auditLog.record({
       actor,
       action: "payment_captured",

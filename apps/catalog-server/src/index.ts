@@ -11,4 +11,10 @@ app.listen(config.port, () => {
   console.log(`  checkout:   POST http://localhost:${config.port}/checkout`);
   console.log(`  dashboard:       http://localhost:${config.port}/dashboard`);
   console.log(`  payment mode: ${config.paymentMode}`);
+  if (config.razorpay.keyId === "rzp_test_placeholder") {
+    console.warn(
+      "⚠️  RAZORPAY_KEY_ID is not set — every checkout will fail with payment_failed. " +
+        "Copy .env.example to .env at the repo root and add your test-mode keys."
+    );
+  }
 });

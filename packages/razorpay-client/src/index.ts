@@ -21,6 +21,17 @@ export interface CreatePaymentLinkInput {
   notes?: Record<string, string>;
   /** Optional — the AI buyer flow has no real human contact details to prefill. */
   customer?: { name?: string; email?: string; contact?: string };
+  /** Unix seconds; Razorpay requires at least 15 minutes in the future. */
+  expireBy?: number;
+}
+
+/**
+ * The id of the payment made against a paid link. The SDK types `payments` as
+ * a single object, but the API returns an array of payments.
+ */
+export function paymentIdFromLink(link: unknown): string | undefined {
+  const payments = (link as { payments?: { payment_id?: string }[] | null }).payments;
+  return Array.isArray(payments) ? payments[0]?.payment_id : undefined;
 }
 
 /**
@@ -92,6 +103,7 @@ export class RazorpayClient {
       reference_id: input.referenceId,
       notes: input.notes,
       customer: input.customer ?? {},
+      expire_by: input.expireBy,
       notify: { sms: false, email: false },
     });
   }

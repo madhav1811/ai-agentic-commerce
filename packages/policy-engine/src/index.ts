@@ -42,6 +42,8 @@ export class PolicyEngine {
   private config: PolicyConfig;
   private statePath: string;
   private state: PolicyState | null = null;
+  /** In-flight (not yet captured) spend per actor. In memory, like the orders it guards. */
+  private reservedByActor = new Map<string, number>();
 
   constructor(config: PolicyConfig, statePath: string) {
     this.config = config;
@@ -105,10 +107,11 @@ export class PolicyEngine {
 
     const state = await this.loadState();
     const spentToday = state.spendByActor[request.actor] ?? 0;
-    if (allowed && spentToday + request.amount > this.config.maxDailySpendPerAgent) {
+    const reserved = this.reservedByActor.get(request.actor) ?? 0;
+    if (allowed && spentToday + reserved + request.amount > this.config.maxDailySpendPerAgent) {
       allowed = false;
       reasons.push(
-        `agent "${request.actor}" would exceed its daily spend bound (${spentToday} spent + ${request.amount} requested > ${this.config.maxDailySpendPerAgent} limit)`
+        `agent "${request.actor}" would exceed its daily spend bound (${spentToday} spent + ${reserved} held for in-flight orders + ${request.amount} requested > ${this.config.maxDailySpendPerAgent} limit)`
       );
     }
 
@@ -124,6 +127,21 @@ export class PolicyEngine {
     }
 
     return { allowed, requiresGate, reasons };
+  }
+
+  /**
+   * Holds `amount` against the actor's daily bound while an order is in flight
+   * (awaiting human approval or an unpaid payment link), so in-flight orders
+   * can't collectively exceed the cap. Pair every call with `release`.
+   */
+  reserve(actor: string, amount: number): void {
+    this.reservedByActor.set(actor, (this.reservedByActor.get(actor) ?? 0) + amount);
+  }
+
+  release(actor: string, amount: number): void {
+    const remaining = (this.reservedByActor.get(actor) ?? 0) - amount;
+    if (remaining > 0) this.reservedByActor.set(actor, remaining);
+    else this.reservedByActor.delete(actor);
   }
 
   /** Call once a payment actually captures, to count it against the agent's daily bound. */

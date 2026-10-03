@@ -1,3 +1,4 @@
+import "./load-env.js";
 import { randomUUID } from "node:crypto";
 import express from "express";
 import { ACTOR_ID } from "./tools.js";

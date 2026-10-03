@@ -1,3 +1,4 @@
+import "./load-env.js";
 import { ACTOR_ID } from "./tools.js";
 import { prompt, closePrompt } from "./human.js";
 import { fetchAuditLog, verifyAuditChain } from "./catalog-client.js";

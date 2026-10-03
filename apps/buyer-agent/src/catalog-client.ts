@@ -29,6 +29,11 @@ export async function requestCheckout(actor: string, items: { productId: string;
   return res.json();
 }
 
+export async function checkPaymentStatus(paymentLinkId: string) {
+  const res = await fetch(`${BASE_URL}/payments/${encodeURIComponent(paymentLinkId)}`);
+  return res.json();
+}
+
 /**
  * Only the operator flow (never the LLM) holds this token — the buyer agent
  * has no tool that can call these endpoints, so it cannot approve its own
