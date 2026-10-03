@@ -23,6 +23,21 @@ const PAYMENT_LINK_TTL_SECONDS = 30 * 60;
  * releases its hold even if nobody ever polls it.
  */
 const EXPIRY_CHECK_INTERVAL_MS = 60 * 1000;
+/** Stop the server's own expiry checks after this many (about an hour); a manual check still works. */
+const MAX_EXPIRY_CHECKS = 60;
+/** How long a settled link's outcome is kept for repeat checks before it is dropped from memory. */
+const SETTLED_RESULT_TTL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * A payment link's outcome is decided by Razorpay, not by us: once it is
+ * paid or expired, failing to write the spend or audit entry must not turn
+ * that outcome into an error. The failure is logged loudly instead.
+ */
+function logSettlementWriteFailure(paymentLinkId: string, what: string, err: unknown): void {
+  console.error(
+    `⚠️  payment link ${paymentLinkId} settled, but recording the ${what} failed: ${(err as Error)?.message ?? err}`
+  );
+}
 
 interface PendingApproval {
   id: string;
@@ -353,6 +368,7 @@ export class CheckoutService {
           ? this.settlePaid(pending, paymentIdFromLink(link) ?? paymentLinkId)
           : this.settleUnpaid(pending, link.status);
       this.settledPayments.set(paymentLinkId, settlement);
+      setTimeout(() => this.settledPayments.delete(paymentLinkId), SETTLED_RESULT_TTL_MS).unref();
       return settlement;
     }
 
@@ -362,20 +378,37 @@ export class CheckoutService {
   /**
    * Checks an unpaid link once it has expired, and keeps checking every
    * interval until Razorpay reports it settled, so its hold is released even
-   * if nobody polls. `unref` keeps the timer from holding the process open.
+   * if nobody polls. Gives up after MAX_EXPIRY_CHECKS, leaving the hold in
+   * place: releasing it without Razorpay's word could oversell a paid order.
+   * `unref` keeps the timer from holding the process open.
    */
-  private scheduleExpiryCheck(paymentLinkId: string, delayMs: number): void {
+  private scheduleExpiryCheck(paymentLinkId: string, delayMs: number, attempt = 1): void {
     setTimeout(async () => {
-      const result = await this.checkPayment(paymentLinkId).catch(() => undefined);
-      if (!result || result.status === "pending_payment") {
-        this.scheduleExpiryCheck(paymentLinkId, EXPIRY_CHECK_INTERVAL_MS);
+      let result: CheckoutResult | undefined;
+      try {
+        result = await this.checkPayment(paymentLinkId);
+      } catch (err) {
+        console.error(`⚠️  expiry check ${attempt} for payment link ${paymentLinkId} failed: ${(err as Error).message}`);
       }
+      if (result && result.status !== "pending_payment") return;
+      if (attempt >= MAX_EXPIRY_CHECKS) {
+        console.error(
+          `⚠️  payment link ${paymentLinkId} still unsettled after ${attempt} expiry checks; its hold stays until ` +
+            `GET /payments/${paymentLinkId} settles it or the server restarts`
+        );
+        return;
+      }
+      this.scheduleExpiryCheck(paymentLinkId, EXPIRY_CHECK_INTERVAL_MS, attempt + 1);
     }, delayMs).unref();
   }
 
   private async settlePaid(pending: PendingPayment, paymentId: string): Promise<CheckoutResult> {
     const { paymentLinkId, actor, items, amount, currency, orderId } = pending;
-    await this.settleHold(actor, items, amount);
+    // settleHold moves the stock synchronously before its first await, so only
+    // the persisted daily-spend write can fail here.
+    await this.settleHold(actor, items, amount).catch((err) =>
+      logSettlementWriteFailure(paymentLinkId, "daily spend", err)
+    );
     await this.auditLog.record({
       actor,
       action: "payment_captured",
@@ -385,7 +418,7 @@ export class CheckoutService {
       status: "success",
       reasons: ["real Razorpay test-mode payment captured via payment link"],
       details: { paymentLinkId, paymentId, simulated: false },
-    });
+    }).catch((err) => logSettlementWriteFailure(paymentLinkId, "audit entry", err));
     return {
       status: "captured",
       orderId,
@@ -411,7 +444,7 @@ export class CheckoutService {
       status: "failure",
       reasons,
       details: { paymentLinkId },
-    });
+    }).catch((err) => logSettlementWriteFailure(paymentLinkId, "audit entry", err));
     return { status: "payment_failed", orderId, reasons };
   }
 
