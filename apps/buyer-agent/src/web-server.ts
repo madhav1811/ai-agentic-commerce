@@ -51,9 +51,13 @@ app.post("/api/chat", async (req, res) => {
 });
 
 app.get("/api/audit", async (_req, res) => {
-  const entries = (await fetchAuditLog()).filter((e: { actor: string }) => e.actor === ACTOR_ID);
-  const chain = await verifyAuditChain();
-  res.json({ entries, chain });
+  try {
+    const entries = (await fetchAuditLog()).filter((e: { actor: string }) => e.actor === ACTOR_ID);
+    const chain = await verifyAuditChain();
+    res.json({ entries, chain });
+  } catch (err) {
+    res.status(502).json({ error: "catalog_unreachable", message: (err as Error).message });
+  }
 });
 
 app.get("/", (_req, res) => {

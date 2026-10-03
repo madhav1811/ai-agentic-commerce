@@ -94,7 +94,15 @@ export async function runTurn(session: Session, humanReply?: string): Promise<Tu
     if (message.tool_calls && message.tool_calls.length > 0) {
       const calls: ToolCallLogEntry[] = [];
       for (const call of message.tool_calls) {
-        const result = await runTool(call.function.name, call.function.arguments);
+        // A failing tool (unknown name, catalog-server down) becomes the tool's
+        // result rather than an exception, so every tool call gets an answer and
+        // the model can tell the user or try something else.
+        let result: unknown;
+        try {
+          result = await runTool(call.function.name, call.function.arguments);
+        } catch (err) {
+          result = { error: "tool_failed", message: (err as Error).message };
+        }
         calls.push({ name: call.function.name, arguments: call.function.arguments, result });
         session.messages.push({ role: "tool", content: JSON.stringify(result) });
       }

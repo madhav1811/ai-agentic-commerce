@@ -15,8 +15,14 @@ import type {
 
 type CartLine = { product: Product; quantity: number };
 
-/** Payment links expire after this long, so an abandoned link eventually releases its hold. */
+/** Payment links expire after this long. */
 const PAYMENT_LINK_TTL_SECONDS = 30 * 60;
+/**
+ * How long after expiry the server checks an unpaid link itself (and again
+ * at this interval until Razorpay reports it settled), so an abandoned link
+ * releases its hold even if nobody ever polls it.
+ */
+const EXPIRY_CHECK_INTERVAL_MS = 60 * 1000;
 
 interface PendingApproval {
   id: string;
@@ -48,6 +54,12 @@ export class CheckoutService {
   private razorpay: RazorpayClient;
   private pendingApprovals = new Map<string, PendingApproval>();
   private pendingPayments = new Map<string, PendingPayment>();
+  /**
+   * Final outcome of every settled payment link, so repeat checks (e.g. a user
+   * saying "I paid" twice) get the same answer instead of "unknown". Stored as
+   * a promise so a check arriving mid-settlement waits for the same result.
+   */
+  private settledPayments = new Map<string, Promise<CheckoutResult>>();
   /** Units held by in-flight orders (awaiting approval or payment), per product id. */
   private reservedStock = new Map<string, number>();
   /**
@@ -309,8 +321,12 @@ export class CheckoutService {
    * Polls Razorpay for a payment link issued in `real_payment_link` mode and
    * settles it: "paid" captures (stock and spend committed), "expired" or
    * "cancelled" fails and releases the hold, anything else is still pending.
+   * Once settled, every later check returns that same outcome.
    */
   async checkPayment(paymentLinkId: string): Promise<CheckoutResult> {
+    const settled = this.settledPayments.get(paymentLinkId);
+    if (settled) return settled;
+
     const pending = this.pendingPayments.get(paymentLinkId);
     if (!pending) {
       return { status: "declined", reasons: [`no payment awaiting confirmation with id "${paymentLinkId}"`] };
@@ -326,56 +342,77 @@ export class CheckoutService {
     }
 
     // Another check may have settled it while we were waiting on Razorpay.
-    if (this.pendingPayments.get(paymentLinkId) !== pending) {
-      return { status: "declined", reasons: [`payment "${paymentLinkId}" was already settled`] };
-    }
+    const settledMeanwhile = this.settledPayments.get(paymentLinkId);
+    if (settledMeanwhile) return settledMeanwhile;
 
-    const { actor, items, amount, currency, orderId } = pending;
-
-    if (link.status === "paid") {
+    if (link.status === "paid" || link.status === "expired" || link.status === "cancelled") {
+      // Recorded synchronously, before any await, so exactly one check settles the link.
       this.pendingPayments.delete(paymentLinkId);
-      await this.settleHold(actor, items, amount);
-      const paymentId = paymentIdFromLink(link) ?? paymentLinkId;
-      await this.auditLog.record({
-        actor,
-        action: "payment_captured",
-        amount,
-        currency,
-        orderId,
-        status: "success",
-        reasons: ["real Razorpay test-mode payment captured via payment link"],
-        details: { paymentLinkId, paymentId, simulated: false },
-      });
-      return {
-        status: "captured",
-        orderId,
-        paymentId,
-        amount,
-        amountDisplay: formatInr(amount),
-        currency,
-        simulated: false,
-        upsell: this.suggestUpsells(items),
-      };
-    }
-
-    if (link.status === "expired" || link.status === "cancelled") {
-      this.pendingPayments.delete(paymentLinkId);
-      this.releaseHold(actor, items, amount);
-      const reasons = [`payment link ${link.status} before it was paid; nothing was charged`];
-      await this.auditLog.record({
-        actor,
-        action: "payment_failed",
-        amount,
-        currency,
-        orderId,
-        status: "failure",
-        reasons,
-        details: { paymentLinkId },
-      });
-      return { status: "payment_failed", orderId, reasons };
+      const settlement =
+        link.status === "paid"
+          ? this.settlePaid(pending, paymentIdFromLink(link) ?? paymentLinkId)
+          : this.settleUnpaid(pending, link.status);
+      this.settledPayments.set(paymentLinkId, settlement);
+      return settlement;
     }
 
     return this.pendingPaymentResult(pending, [`payment link is "${link.status}"; not paid yet`]);
+  }
+
+  /**
+   * Checks an unpaid link once it has expired, and keeps checking every
+   * interval until Razorpay reports it settled, so its hold is released even
+   * if nobody polls. `unref` keeps the timer from holding the process open.
+   */
+  private scheduleExpiryCheck(paymentLinkId: string, delayMs: number): void {
+    setTimeout(async () => {
+      const result = await this.checkPayment(paymentLinkId).catch(() => undefined);
+      if (!result || result.status === "pending_payment") {
+        this.scheduleExpiryCheck(paymentLinkId, EXPIRY_CHECK_INTERVAL_MS);
+      }
+    }, delayMs).unref();
+  }
+
+  private async settlePaid(pending: PendingPayment, paymentId: string): Promise<CheckoutResult> {
+    const { paymentLinkId, actor, items, amount, currency, orderId } = pending;
+    await this.settleHold(actor, items, amount);
+    await this.auditLog.record({
+      actor,
+      action: "payment_captured",
+      amount,
+      currency,
+      orderId,
+      status: "success",
+      reasons: ["real Razorpay test-mode payment captured via payment link"],
+      details: { paymentLinkId, paymentId, simulated: false },
+    });
+    return {
+      status: "captured",
+      orderId,
+      paymentId,
+      amount,
+      amountDisplay: formatInr(amount),
+      currency,
+      simulated: false,
+      upsell: this.suggestUpsells(items),
+    };
+  }
+
+  private async settleUnpaid(pending: PendingPayment, linkStatus: "expired" | "cancelled"): Promise<CheckoutResult> {
+    const { paymentLinkId, actor, items, amount, currency, orderId } = pending;
+    this.releaseHold(actor, items, amount);
+    const reasons = [`payment link ${linkStatus} before it was paid; nothing was charged`];
+    await this.auditLog.record({
+      actor,
+      action: "payment_failed",
+      amount,
+      currency,
+      orderId,
+      status: "failure",
+      reasons,
+      details: { paymentLinkId },
+    });
+    return { status: "payment_failed", orderId, reasons };
   }
 
   private pendingPaymentResult(pending: PendingPayment, reasons: string[]): CheckoutResult {
@@ -466,6 +503,7 @@ export class CheckoutService {
         currency,
       };
       this.pendingPayments.set(link.id, pending);
+      this.scheduleExpiryCheck(link.id, PAYMENT_LINK_TTL_SECONDS * 1000 + EXPIRY_CHECK_INTERVAL_MS);
       const reasons = [
         "real Razorpay payment link issued; nothing is captured until a human pays it",
         `link expires in ${PAYMENT_LINK_TTL_SECONDS / 60} minutes`,
