@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { AuditLog } from "@aac/audit-log";
-import { PolicyEngine, type PolicyDecision } from "@aac/policy-engine";
+import { AuditLog, type AuditEntryInput } from "@aac/audit-log";
+import { PolicyEngine, SpendNotPersistedError, type PolicyDecision } from "@aac/policy-engine";
 import { RazorpayClient, describeRazorpayError, paymentIdFromLink } from "@aac/razorpay-client";
 import { config, loadCatalog } from "./config.js";
 import { formatInr, rankProducts, type RecommendCriteria, type RankedProduct } from "./recommend.js";
@@ -23,20 +23,23 @@ const PAYMENT_LINK_TTL_SECONDS = 30 * 60;
  * releases its hold even if nobody ever polls it.
  */
 const EXPIRY_CHECK_INTERVAL_MS = 60 * 1000;
-/** Stop the server's own expiry checks after this many (about an hour); a manual check still works. */
+/** After this many checks (about an hour), keep checking but only every SLOW_EXPIRY_CHECK_INTERVAL_MS. */
 const MAX_EXPIRY_CHECKS = 60;
+const SLOW_EXPIRY_CHECK_INTERVAL_MS = 15 * 60 * 1000;
 /** How long a settled link's outcome is kept for repeat checks before it is dropped from memory. */
 const SETTLED_RESULT_TTL_MS = 24 * 60 * 60 * 1000;
+/** A gated order nobody approves or denies within this long is expired and its hold released. */
+const APPROVAL_TTL_MS = 30 * 60 * 1000;
 
 /**
- * A payment link's outcome is decided by Razorpay, not by us: once it is
- * paid or expired, failing to write the spend or audit entry must not turn
- * that outcome into an error. The failure is logged loudly instead.
+ * Once an outcome is decided (Razorpay created an order, a link was paid or
+ * expired, an operator denied), failing to write the spend or audit entry
+ * must not turn that outcome into an error or strand a hold. The failure is
+ * logged loudly instead. Audit writes *before* a decision stay fatal: no
+ * money moves without a record of why.
  */
-function logSettlementWriteFailure(paymentLinkId: string, what: string, err: unknown): void {
-  console.error(
-    `⚠️  payment link ${paymentLinkId} settled, but recording the ${what} failed: ${(err as Error)?.message ?? err}`
-  );
+function logWriteFailure(subject: string, what: string, err: unknown): void {
+  console.error(`⚠️  ${subject}: the outcome stands, but recording the ${what} failed: ${(err as Error)?.message ?? err}`);
 }
 
 interface PendingApproval {
@@ -91,8 +94,14 @@ export class CheckoutService {
     this.razorpay = new RazorpayClient(config.razorpay);
   }
 
+  /** Products as buyers see them: `stock` excludes units held by in-flight orders. */
   listProducts(): Product[] {
-    return this.catalog.products;
+    return this.catalog.products.map((p) => this.buyerView(p));
+  }
+
+  getProductView(productId: string): Product | undefined {
+    const product = this.getProduct(productId);
+    return product && this.buyerView(product);
   }
 
   getProduct(productId: string): Product | undefined {
@@ -100,7 +109,11 @@ export class CheckoutService {
   }
 
   recommend(criteria: RecommendCriteria): RankedProduct[] {
-    return rankProducts(this.catalog.products, criteria);
+    return rankProducts(this.listProducts(), criteria);
+  }
+
+  private buyerView(product: Product): Product {
+    return { ...product, stock: this.available(product) };
   }
 
   /** Stock not already held by an in-flight order. */
@@ -128,7 +141,7 @@ export class CheckoutService {
         const upsellProduct = this.getProduct(upsellId);
         if (!upsellProduct || this.available(upsellProduct) <= 0) continue;
         suggestions.set(upsellId, {
-          product: upsellProduct,
+          product: this.buyerView(upsellProduct),
           reason: `frequently bought with "${product.name}"`,
           priceDisplay: formatInr(upsellProduct.price),
         });
@@ -151,21 +164,42 @@ export class CheckoutService {
   }
 
   private releaseHold(actor: string, lines: CartLine[], amount: number): void {
+    this.releaseStock(lines);
+    this.policy.release(actor, amount);
+  }
+
+  private releaseStock(lines: CartLine[]): void {
     for (const { product, quantity } of lines) {
       const remaining = (this.reservedStock.get(product.id) ?? 0) - quantity;
       if (remaining > 0) this.reservedStock.set(product.id, remaining);
       else this.reservedStock.delete(product.id);
     }
-    this.policy.release(actor, amount);
   }
 
-  /** Turns a held order into a sale: stock leaves the shelf and spend counts against the daily bound. */
+  /**
+   * Turns a held order into a sale: stock leaves the shelf (synchronously) and
+   * the spend moves from held to committed against the daily bound. The spend
+   * is never left counted nowhere: if committing fails before it is counted,
+   * the hold keeps counting it until restart. Rejects so the caller can log.
+   */
   private async settleHold(actor: string, lines: CartLine[], amount: number): Promise<void> {
-    this.releaseHold(actor, lines, amount);
+    this.releaseStock(lines);
     for (const { product, quantity } of lines) {
       product.stock -= quantity;
     }
-    await this.policy.commitSpend(actor, amount);
+    try {
+      await this.policy.commitSpend(actor, amount);
+    } catch (err) {
+      // Counted in memory, only the file write failed: the hold is no longer needed.
+      if (err instanceof SpendNotPersistedError) this.policy.release(actor, amount);
+      throw err;
+    }
+    this.policy.release(actor, amount);
+  }
+
+  /** An audit write after the outcome is decided: failures are logged, never thrown (see logWriteFailure). */
+  private async recordOutcome(subject: string, entry: AuditEntryInput): Promise<void> {
+    await this.auditLog.record(entry).catch((err) => logWriteFailure(subject, "audit entry", err));
   }
 
   /**
@@ -202,7 +236,10 @@ export class CheckoutService {
           reasons,
           details: { outOfStockProductId: product.id, suggestionId: suggestion?.id },
         });
-        return { ok: false, result: { status: "declined", reasons, suggestion } };
+        return {
+          ok: false,
+          result: { status: "declined", reasons, suggestion: suggestion && this.buyerView(suggestion) },
+        };
       }
       lines.push({ product, quantity: item.quantity });
     }
@@ -253,19 +290,24 @@ export class CheckoutService {
         currency,
         createdAt: new Date().toISOString(),
       });
-      await this.auditLog.record({
+      setTimeout(() => void this.expireApproval(approvalId), APPROVAL_TTL_MS).unref();
+      const reasons = [
+        ...decision.reasons,
+        `expires in ${APPROVAL_TTL_MS / 60000} minutes if no operator approves or denies it`,
+      ];
+      await this.recordOutcome(`approval ${approvalId}`, {
         actor: request.actor,
         action: "gate_required",
         amount,
         currency,
         status: "pending",
-        reasons: decision.reasons,
+        reasons,
         details: { approvalId },
       });
       return {
         status: "pending_approval",
         approvalId,
-        reasons: decision.reasons,
+        reasons,
         amount,
         amountDisplay: formatInr(amount),
         currency,
@@ -281,15 +323,22 @@ export class CheckoutService {
       return { status: "declined", reasons: [`no pending approval with id "${approvalId}"`] };
     }
     this.pendingApprovals.delete(approvalId);
-    await this.auditLog.record({
-      actor: pending.actor,
-      action: "gate_approved",
-      amount: pending.amount,
-      currency: pending.currency,
-      status: "allowed",
-      reasons: [`approved by ${approvedBy}`],
-      details: { approvalId },
-    });
+    try {
+      await this.auditLog.record({
+        actor: pending.actor,
+        action: "gate_approved",
+        amount: pending.amount,
+        currency: pending.currency,
+        status: "allowed",
+        reasons: [`approved by ${approvedBy}`],
+        details: { approvalId },
+      });
+    } catch (err) {
+      // No money moves without a record of the approval. Put it back (hold
+      // intact) so the operator can retry once the audit log is writable.
+      this.pendingApprovals.set(approvalId, pending);
+      throw err;
+    }
 
     // Approval is a human's yes to *this* order, not a bypass: re-run stock and
     // policy against current state (bounds or the day may have changed) before
@@ -306,7 +355,12 @@ export class CheckoutService {
       const reasons = [
         `order total changed from ${formatInr(pending.amount)} to ${formatInr(check.amount)} since it was approved; resubmit for a fresh approval`,
       ];
-      await this.auditLog.record({ actor: pending.actor, action: "checkout_declined", status: "denied", reasons });
+      await this.recordOutcome(`approval ${approvalId}`, {
+        actor: pending.actor,
+        action: "checkout_declined",
+        status: "denied",
+        reasons,
+      });
       return { status: "declined", reasons };
     }
 
@@ -320,7 +374,7 @@ export class CheckoutService {
     }
     this.pendingApprovals.delete(approvalId);
     this.releaseHold(pending.actor, pending.items, pending.amount);
-    await this.auditLog.record({
+    await this.recordOutcome(`approval ${approvalId}`, {
       actor: pending.actor,
       action: "gate_denied",
       amount: pending.amount,
@@ -330,6 +384,23 @@ export class CheckoutService {
       details: { approvalId },
     });
     return { status: "declined", reasons: [`denied by ${deniedBy}: ${reason}`] };
+  }
+
+  /** Releases the hold of a gated order nobody approved or denied in time. */
+  private async expireApproval(approvalId: string): Promise<void> {
+    const pending = this.pendingApprovals.get(approvalId);
+    if (!pending) return;
+    this.pendingApprovals.delete(approvalId);
+    this.releaseHold(pending.actor, pending.items, pending.amount);
+    await this.recordOutcome(`approval ${approvalId}`, {
+      actor: pending.actor,
+      action: "gate_expired",
+      amount: pending.amount,
+      currency: pending.currency,
+      status: "denied",
+      reasons: [`no operator decision within ${APPROVAL_TTL_MS / 60000} minutes; hold released`],
+      details: { approvalId },
+    });
   }
 
   /**
@@ -378,8 +449,9 @@ export class CheckoutService {
   /**
    * Checks an unpaid link once it has expired, and keeps checking every
    * interval until Razorpay reports it settled, so its hold is released even
-   * if nobody polls. Gives up after MAX_EXPIRY_CHECKS, leaving the hold in
-   * place: releasing it without Razorpay's word could oversell a paid order.
+   * if nobody polls. After MAX_EXPIRY_CHECKS it slows down rather than stops:
+   * the hold is never released without Razorpay's word (that could oversell a
+   * paid order), so a long Razorpay outage still settles once it recovers.
    * `unref` keeps the timer from holding the process open.
    */
   private scheduleExpiryCheck(paymentLinkId: string, delayMs: number, attempt = 1): void {
@@ -391,25 +463,22 @@ export class CheckoutService {
         console.error(`⚠️  expiry check ${attempt} for payment link ${paymentLinkId} failed: ${(err as Error).message}`);
       }
       if (result && result.status !== "pending_payment") return;
-      if (attempt >= MAX_EXPIRY_CHECKS) {
+      if (attempt === MAX_EXPIRY_CHECKS) {
         console.error(
-          `⚠️  payment link ${paymentLinkId} still unsettled after ${attempt} expiry checks; its hold stays until ` +
-            `GET /payments/${paymentLinkId} settles it or the server restarts`
+          `⚠️  payment link ${paymentLinkId} still unsettled after ${attempt} expiry checks; ` +
+            `checking every ${SLOW_EXPIRY_CHECK_INTERVAL_MS / 60000} minutes from now on`
         );
-        return;
       }
-      this.scheduleExpiryCheck(paymentLinkId, EXPIRY_CHECK_INTERVAL_MS, attempt + 1);
+      const nextDelay = attempt >= MAX_EXPIRY_CHECKS ? SLOW_EXPIRY_CHECK_INTERVAL_MS : EXPIRY_CHECK_INTERVAL_MS;
+      this.scheduleExpiryCheck(paymentLinkId, nextDelay, attempt + 1);
     }, delayMs).unref();
   }
 
   private async settlePaid(pending: PendingPayment, paymentId: string): Promise<CheckoutResult> {
     const { paymentLinkId, actor, items, amount, currency, orderId } = pending;
-    // settleHold moves the stock synchronously before its first await, so only
-    // the persisted daily-spend write can fail here.
-    await this.settleHold(actor, items, amount).catch((err) =>
-      logSettlementWriteFailure(paymentLinkId, "daily spend", err)
-    );
-    await this.auditLog.record({
+    const subject = `payment link ${paymentLinkId}`;
+    await this.settleHold(actor, items, amount).catch((err) => logWriteFailure(subject, "daily spend", err));
+    await this.recordOutcome(subject, {
       actor,
       action: "payment_captured",
       amount,
@@ -418,7 +487,7 @@ export class CheckoutService {
       status: "success",
       reasons: ["real Razorpay test-mode payment captured via payment link"],
       details: { paymentLinkId, paymentId, simulated: false },
-    }).catch((err) => logSettlementWriteFailure(paymentLinkId, "audit entry", err));
+    });
     return {
       status: "captured",
       orderId,
@@ -435,7 +504,7 @@ export class CheckoutService {
     const { paymentLinkId, actor, items, amount, currency, orderId } = pending;
     this.releaseHold(actor, items, amount);
     const reasons = [`payment link ${linkStatus} before it was paid; nothing was charged`];
-    await this.auditLog.record({
+    await this.recordOutcome(`payment link ${paymentLinkId}`, {
       actor,
       action: "payment_failed",
       amount,
@@ -444,7 +513,7 @@ export class CheckoutService {
       status: "failure",
       reasons,
       details: { paymentLinkId },
-    }).catch((err) => logSettlementWriteFailure(paymentLinkId, "audit entry", err));
+    });
     return { status: "payment_failed", orderId, reasons };
   }
 
@@ -479,7 +548,7 @@ export class CheckoutService {
     } catch (err) {
       this.releaseHold(actor, items, amount);
       const message = describeRazorpayError(err);
-      await this.auditLog.record({
+      await this.recordOutcome(`order for ${actor}`, {
         actor,
         action: "payment_failed",
         amount,
@@ -490,7 +559,8 @@ export class CheckoutService {
       return { status: "payment_failed", orderId: "unknown", reasons: [`order creation failed: ${message}`] };
     }
 
-    await this.auditLog.record({
+    const subject = `order ${order.id}`;
+    await this.recordOutcome(subject, {
       actor,
       action: "order_created",
       amount,
@@ -513,7 +583,7 @@ export class CheckoutService {
       } catch (err) {
         this.releaseHold(actor, items, amount);
         const message = describeRazorpayError(err);
-        await this.auditLog.record({
+        await this.recordOutcome(subject, {
           actor,
           action: "payment_failed",
           amount,
@@ -541,7 +611,7 @@ export class CheckoutService {
         "real Razorpay payment link issued; nothing is captured until a human pays it",
         `link expires in ${PAYMENT_LINK_TTL_SECONDS / 60} minutes`,
       ];
-      await this.auditLog.record({
+      await this.recordOutcome(subject, {
         actor,
         action: "payment_pending",
         amount,
@@ -555,8 +625,8 @@ export class CheckoutService {
     }
 
     const payment = this.razorpay.simulateCapture(order.id, amount, currency);
-    await this.settleHold(actor, items, amount);
-    await this.auditLog.record({
+    await this.settleHold(actor, items, amount).catch((err) => logWriteFailure(subject, "daily spend", err));
+    await this.recordOutcome(subject, {
       actor,
       action: "payment_captured",
       amount,

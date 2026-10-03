@@ -1,4 +1,4 @@
-import express from "express";
+import express, { type NextFunction, type Request, type RequestHandler, type Response } from "express";
 import { z } from "zod";
 import { config } from "./config.js";
 import { CheckoutService } from "./checkout-service.js";
@@ -20,6 +20,17 @@ const recommendRequestSchema = z.object({
   excludeIds: z.array(z.string()).optional(),
 });
 
+/**
+ * Express 4 doesn't catch rejected promises from async handlers: the request
+ * hangs and the unhandled rejection kills the process, taking every in-memory
+ * hold, approval and payment link with it. This forwards them to the error handler.
+ */
+function asyncRoute(handler: (req: Request, res: Response) => Promise<unknown>): RequestHandler {
+  return (req, res, next) => {
+    handler(req, res).catch(next);
+  };
+}
+
 export function createServer(service: CheckoutService) {
   const app = express();
   app.use(express.json());
@@ -39,7 +50,7 @@ export function createServer(service: CheckoutService) {
   });
 
   app.get("/catalog/:id", (req, res) => {
-    const product = service.getProduct(req.params.id);
+    const product = service.getProductView(req.params.id);
     if (!product) return res.status(404).json({ error: "not_found" });
     res.json(product);
   });
@@ -55,25 +66,25 @@ export function createServer(service: CheckoutService) {
     res.json({ candidates: service.recommend(parsed.data) });
   });
 
-  app.post("/checkout", async (req, res) => {
+  app.post("/checkout", asyncRoute(async (req, res) => {
     const parsed = checkoutRequestSchema.safeParse(req.body);
     if (!parsed.success) {
       return res.status(400).json({ error: "invalid_request", details: parsed.error.flatten() });
     }
     const result = await service.requestCheckout(parsed.data);
     res.json(result);
-  });
+  }));
 
-  app.post("/checkout/:approvalId/approve", async (req, res) => {
+  app.post("/checkout/:approvalId/approve", asyncRoute(async (req, res) => {
     if (req.header("x-approval-token") !== config.approvalToken) {
       return res.status(401).json({ error: "unauthorized" });
     }
     const approvedBy = (req.body?.approvedBy as string | undefined) ?? "human-operator";
     const result = await service.approve(req.params.approvalId, approvedBy);
     res.json(result);
-  });
+  }));
 
-  app.post("/checkout/:approvalId/deny", async (req, res) => {
+  app.post("/checkout/:approvalId/deny", asyncRoute(async (req, res) => {
     if (req.header("x-approval-token") !== config.approvalToken) {
       return res.status(401).json({ error: "unauthorized" });
     }
@@ -81,27 +92,38 @@ export function createServer(service: CheckoutService) {
     const reason = (req.body?.reason as string | undefined) ?? "not specified";
     const result = await service.deny(req.params.approvalId, deniedBy, reason);
     res.json(result);
-  });
+  }));
 
   // Confirms a payment link issued in real_payment_link mode. Only "paid" ever
   // turns into "captured"; until then the order stays pending_payment.
-  app.get("/payments/:paymentLinkId", async (req, res) => {
+  app.get("/payments/:paymentLinkId", asyncRoute(async (req, res) => {
     const result = await service.checkPayment(req.params.paymentLinkId);
     res.json(result);
-  });
+  }));
 
-  app.get("/audit-log", async (_req, res) => {
+  app.get("/audit-log", asyncRoute(async (_req, res) => {
     const entries = await service.auditLog.readAll();
     res.json(entries);
-  });
+  }));
 
-  app.get("/audit-log/verify", async (_req, res) => {
+  app.get("/audit-log/verify", asyncRoute(async (_req, res) => {
     const result = await service.auditLog.verifyChain();
     res.json(result);
-  });
+  }));
 
   app.get("/dashboard", (_req, res) => {
     res.type("html").send(dashboardHtml);
+  });
+
+  // Last: turns any error (a rejected async route, a malformed JSON body) into
+  // a JSON response instead of a hung request or a crashed server.
+  app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+    const status = (err as { status?: number }).status ?? 500;
+    if (status >= 500) console.error("⚠️  request failed:", err);
+    res.status(status).json({
+      error: status >= 500 ? "internal_error" : "bad_request",
+      message: (err as Error)?.message ?? String(err),
+    });
   });
 
   return app;
@@ -136,6 +158,11 @@ const dashboardHtml = `<!doctype html>
   <tbody></tbody>
 </table>
 <script>
+// actor, reasons and the rest come from request bodies (anyone can POST
+// /checkout), so every value is escaped before it touches innerHTML.
+function esc(value) {
+  return String(value ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
 async function load() {
   const [entries, chain] = await Promise.all([
     fetch('/audit-log').then(r => r.json()),
@@ -147,13 +174,13 @@ async function load() {
   const tbody = document.querySelector('#log tbody');
   tbody.innerHTML = entries.slice().reverse().map(e => \`
     <tr>
-      <td>\${e.seq}</td>
-      <td>\${e.timestamp}</td>
-      <td>\${e.actor}</td>
-      <td><code>\${e.action}</code></td>
-      <td>\${e.amount ? (e.amount / 100).toFixed(2) + ' ' + (e.currency || '') : ''}</td>
-      <td class="status-\${e.status}">\${e.status}</td>
-      <td>\${(e.reasons || []).join('; ')}</td>
+      <td>\${esc(e.seq)}</td>
+      <td>\${esc(e.timestamp)}</td>
+      <td>\${esc(e.actor)}</td>
+      <td><code>\${esc(e.action)}</code></td>
+      <td>\${e.amount ? esc((e.amount / 100).toFixed(2) + ' ' + (e.currency || '')) : ''}</td>
+      <td class="status-\${esc(e.status)}">\${esc(e.status)}</td>
+      <td>\${esc((e.reasons || []).join('; '))}</td>
     </tr>\`).join('');
 }
 load();

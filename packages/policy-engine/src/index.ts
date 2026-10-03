@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
 /**
@@ -34,6 +34,18 @@ interface PolicyState {
   spendByActor: Record<string, number>;
 }
 
+/**
+ * Thrown by `commitSpend` when the spend *was* counted in memory but writing
+ * the state file failed. Any other error from `commitSpend` means the spend
+ * was not counted at all.
+ */
+export class SpendNotPersistedError extends Error {
+  constructor(cause: unknown) {
+    super(`spend counted in memory but not saved: ${(cause as Error)?.message ?? cause}`, { cause });
+    this.name = "SpendNotPersistedError";
+  }
+}
+
 function todayKey(): string {
   return new Date().toISOString().slice(0, 10);
 }
@@ -44,6 +56,12 @@ export class PolicyEngine {
   private state: PolicyState | null = null;
   /** In-flight (not yet captured) spend per actor. In memory, like the orders it guards. */
   private reservedByActor = new Map<string, number>();
+  /**
+   * Tail of the state queue. Loading, updating and writing the spend state run
+   * one at a time, so concurrent captures can't interleave writes to the state
+   * file, and two loads at the day rollover can't each install a fresh state.
+   */
+  private stateQueue: Promise<unknown> = Promise.resolve();
 
   constructor(config: PolicyConfig, statePath: string) {
     this.config = config;
@@ -67,9 +85,18 @@ export class PolicyEngine {
     return this.state;
   }
 
+  /** Writes to a temp file and renames it over the real one, so a crash mid-write can't leave a truncated file. */
   private async saveState(): Promise<void> {
     if (!this.state) return;
-    await writeFile(this.statePath, JSON.stringify(this.state, null, 2), "utf8");
+    const tmpPath = `${this.statePath}.tmp`;
+    await writeFile(tmpPath, JSON.stringify(this.state, null, 2), "utf8");
+    await rename(tmpPath, this.statePath);
+  }
+
+  private serialize<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.stateQueue.then(fn);
+    this.stateQueue = run.catch(() => undefined);
+    return run;
   }
 
   /** Pure evaluation against configured bounds. Does not mutate spend state. */
@@ -105,7 +132,7 @@ export class PolicyEngine {
       );
     }
 
-    const state = await this.loadState();
+    const state = await this.serialize(() => this.loadState());
     const spentToday = state.spendByActor[request.actor] ?? 0;
     const reserved = this.reservedByActor.get(request.actor) ?? 0;
     if (allowed && spentToday + reserved + request.amount > this.config.maxDailySpendPerAgent) {
@@ -144,11 +171,22 @@ export class PolicyEngine {
     else this.reservedByActor.delete(actor);
   }
 
-  /** Call once a payment actually captures, to count it against the agent's daily bound. */
-  async commitSpend(actor: string, amount: number): Promise<void> {
-    const state = await this.loadState();
-    state.spendByActor[actor] = (state.spendByActor[actor] ?? 0) + amount;
-    await this.saveState();
+  /**
+   * Call once a payment actually captures, to count it against the agent's
+   * daily bound. Counts in memory first, then saves. Rejects with
+   * `SpendNotPersistedError` if only the save failed (the spend still counts
+   * for this process); any other rejection means it was not counted.
+   */
+  commitSpend(actor: string, amount: number): Promise<void> {
+    return this.serialize(async () => {
+      const state = await this.loadState();
+      state.spendByActor[actor] = (state.spendByActor[actor] ?? 0) + amount;
+      try {
+        await this.saveState();
+      } catch (err) {
+        throw new SpendNotPersistedError(err);
+      }
+    });
   }
 
   getConfig(): PolicyConfig {

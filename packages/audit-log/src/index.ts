@@ -19,6 +19,7 @@ export interface AuditEntry {
     | "gate_required"
     | "gate_approved"
     | "gate_denied"
+    | "gate_expired"
     | "order_created"
     | "payment_pending"
     | "payment_captured"
