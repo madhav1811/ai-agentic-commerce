@@ -83,6 +83,13 @@ export function createServer(service: CheckoutService) {
     res.json(result);
   });
 
+  // Confirms a payment link issued in real_payment_link mode. Only "paid" ever
+  // turns into "captured"; until then the order stays pending_payment.
+  app.get("/payments/:paymentLinkId", async (req, res) => {
+    const result = await service.checkPayment(req.params.paymentLinkId);
+    res.json(result);
+  });
+
   app.get("/audit-log", async (_req, res) => {
     const entries = await service.auditLog.readAll();
     res.json(entries);

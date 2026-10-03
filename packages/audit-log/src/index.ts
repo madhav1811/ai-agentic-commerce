@@ -20,6 +20,7 @@ export interface AuditEntry {
     | "gate_approved"
     | "gate_denied"
     | "order_created"
+    | "payment_pending"
     | "payment_captured"
     | "payment_failed"
     | "checkout_declined"
@@ -60,6 +61,8 @@ export class AuditLog {
   private seq = 0;
   private lastHash = GENESIS_HASH;
   private ready: Promise<void>;
+  /** Tail of the write queue — every append chains onto it so entries are written strictly one at a time. */
+  private writeQueue: Promise<unknown> = Promise.resolve();
 
   constructor(filePath: string) {
     this.filePath = filePath;
@@ -81,12 +84,24 @@ export class AuditLog {
     }
   }
 
-  /** Appends a new entry, chained to the previous one, and returns it. */
-  async record(input: AuditEntryInput): Promise<AuditEntry> {
+  /**
+   * Appends a new entry, chained to the previous one, and returns it.
+   *
+   * Calls are serialized: without this, two concurrent checkouts would both
+   * read the same `lastHash` before either append finished, writing two
+   * entries with the same `prevHash` and breaking the chain on honest traffic.
+   */
+  record(input: AuditEntryInput): Promise<AuditEntry> {
+    const entry = this.writeQueue.then(() => this.append(input));
+    // Keep the queue alive if one append fails; the caller still sees the rejection.
+    this.writeQueue = entry.catch(() => undefined);
+    return entry;
+  }
+
+  private async append(input: AuditEntryInput): Promise<AuditEntry> {
     await this.ready;
-    this.seq += 1;
     const draft = {
-      seq: this.seq,
+      seq: this.seq + 1,
       timestamp: new Date().toISOString(),
       prevHash: this.lastHash,
       ...input,
@@ -94,6 +109,8 @@ export class AuditLog {
     const hash = hashEntry(draft);
     const entry: AuditEntry = { ...draft, hash };
     await appendFile(this.filePath, JSON.stringify(entry) + "\n", "utf8");
+    // Only advance the chain once the entry is actually on disk.
+    this.seq = draft.seq;
     this.lastHash = hash;
     return entry;
   }

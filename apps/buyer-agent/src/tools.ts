@@ -1,4 +1,4 @@
-import { listProducts, recommendProducts, requestCheckout } from "./catalog-client.js";
+import { checkPaymentStatus, listProducts, recommendProducts, requestCheckout } from "./catalog-client.js";
 import { reviewGate } from "./operator.js";
 
 export const ACTOR_ID = "buyer-agent-local-llm";
@@ -61,8 +61,12 @@ export const tools: ToolDef[] = [
       description:
         "Attempt to buy one or more products. This call is bounded (max order amount, daily spend cap, " +
         "allowed categories) and may pause for human approval if it crosses the merchant's gate threshold — " +
-        "you will only ever see the final outcome (captured, declined, or payment_failed) with `reasons` " +
-        "explaining the decision. You cannot approve your own gated checkout.",
+        "you will only ever see the outcome (captured, pending_payment, declined, or payment_failed) with " +
+        "`reasons` explaining the decision. You cannot approve your own gated checkout. 'pending_payment' " +
+        "means a real payment link was issued and NOTHING is paid yet: give the user its paymentUrl and use " +
+        "check_payment_status when they say they've paid. On status 'captured', the " +
+        "response includes an `upsell` array of real, in-stock, frequently-paired products (each with its " +
+        "own priceDisplay and reason) — never invent an upsell yourself, only offer what's actually there.",
       parameters: {
         type: "object",
         properties: {
@@ -79,6 +83,22 @@ export const tools: ToolDef[] = [
           },
         },
         required: ["items"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "check_payment_status",
+      description:
+        "Check whether the payment link from a 'pending_payment' checkout has been paid. Returns 'captured' " +
+        "once paid, 'payment_failed' if the link expired or was cancelled, or 'pending_payment' if not paid yet.",
+      parameters: {
+        type: "object",
+        properties: {
+          paymentLinkId: { type: "string", description: "the paymentLinkId from the pending_payment result" },
+        },
+        required: ["paymentLinkId"],
       },
     },
   },
@@ -105,6 +125,10 @@ export async function runTool(name: string, input: Record<string, unknown>): Pro
     }
 
     return result;
+  }
+
+  if (name === "check_payment_status") {
+    return checkPaymentStatus(String(input.paymentLinkId));
   }
 
   throw new Error(`Unknown tool: ${name}`);
